@@ -352,14 +352,14 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
     u8 lo = port & 0xFF;
     TRACE_PORT_W(m->cpu.total_tstates, m->cpu.pc.w, port, data);
 
-    /* During starting, I/O writes clear starting flag but are processed.
-     * In real DCP, starting clears on first non-memory bus cycle. */
+    /* During starting, ALL I/O writes are ignored (MAME: dcp_w returns immediately).
+     * The starting flag is only cleared by port READS, not writes.
+     * This matches the real DCP hardware behavior. */
     if (m->starting) {
         TRACE_BOOT(m->cpu.total_tstates, m->cpu.pc.w,
-                   "starting cleared by port WRITE %04X=%02X",
+                   "WRITE %04X=%02X IGNORED (starting)",
                    (unsigned)port, (unsigned)data);
-        m->starting = false;
-        update_memory(m);
+        return;
     }
 
     /* === Special-cased ports (before DCP): 0x3C/0x7C === */
