@@ -441,12 +441,16 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
 
     /* === Sprinter page register ports (DCP-decoded in real HW) ===
      * Ports 0x82/0xA2 are below 0xC0, need explicit handlers.
-     * They map through DCP to modify WIN0/WIN1 page registers.
-     * Ports 0xC2/0xE2 are in the 0xC0+ system port range and are
-     * handled by the system port default handler via ram_pages[lo-0xC0].
-     * update_memory() reads from ram_pages[0x28-0x2B] for WIN0-WIN3. */
-    if (lo == 0x82) { m->ram_pages[0x28] = data; update_memory(m); return; } /* WIN0 (when in RAM mode) */
-    if (lo == 0xA2) { m->ram_pages[0x29] = data; update_memory(m); return; } /* WIN1 */
+     * For OUT(n),A: port = (A<<8)|n. When A is the page number,
+     * high byte is small (0x00-0x3F typically). When high byte is
+     * 0xFF or other large values, the DCP routes to a different
+     * handler — NOT a page register write. */
+    if (lo == 0x82 && (port >> 8) < 0x80) {
+        m->ram_pages[0x28] = data; update_memory(m); return;
+    }
+    if (lo == 0xA2 && (port >> 8) < 0x80) {
+        m->ram_pages[0x29] = data; update_memory(m); return;
+    }
 
     /* === DCP-decoded system ports 0xC0-0xFF → ram_pages writes === */
     if (lo >= 0xC0) {
