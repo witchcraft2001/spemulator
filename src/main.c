@@ -109,13 +109,29 @@ int main(int argc, char **argv) {
             machine_run_frame(machine);
 
             /* Boot trace */
-            if (machine->frame_count <= 3 || machine->frame_count == 20) {
+            if (machine->frame_count <= 3 ||
+                machine->frame_count == 100 ||
+                machine->frame_count == 500 ||
+                machine->frame_count == 2000 ||
+                machine->frame_count == 5000) {
                 printf("F%3d: PC=%04X SP=%04X IFF=%d Pg=%02X/%02X/%02X/%02X\n",
                        machine->frame_count,
                        machine->cpu.pc.w, machine->cpu.sp.w,
                        machine->cpu.iff1,
                        machine->page_reg[0], machine->page_reg[1],
                        machine->page_reg[2], machine->page_reg[3]);
+            }
+            if (machine->frame_count == 5000) {
+                int nonzero = 0;
+                for (int i = 0; i < SP_VRAM_LINES * SP_VRAM_LINE; i++)
+                    if (machine->vram[i]) nonzero++;
+                printf("VRAM: %d non-zero bytes\n", nonzero);
+                /* Check framebuffer for non-black pixels */
+                int fb_nonblack = 0;
+                for (int i = 0; i < machine->fb_width * machine->fb_height; i++)
+                    if (machine->framebuffer[i] != 0) fb_nonblack++;
+                printf("FB: %d non-black pixels\n", fb_nonblack);
+                fflush(stdout);
             }
         }
 

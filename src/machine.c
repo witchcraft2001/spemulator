@@ -91,11 +91,15 @@ void machine_mem_write(void *ctx, u16 addr, u8 data) {
     sp_machine_t *m = (sp_machine_t *)ctx;
     int win = addr >> 14;
 
-    /* During configuration loading, WIN0 writes go to RAM page 0 (working area) */
-    if (win == 0 && m->conf_loading) {
-        u32 phys = addr & 0x3FFF;
-        if (phys < SP_RAM_SIZE)
-            m->ram[phys] = data;
+    /* During configuration loading, WIN0 writes are ignored (ROM area) */
+    if (win == 0 && m->conf_loading)
+        return;
+
+    /* During conf loading, intercept WIN3 writes at 0xFE00-0xFEFF:
+     * this is the FPGA configuration memory-mapped port.
+     * Don't write bitstream data to RAM — count bytes instead. */
+    if (m->conf_loading && win == 3 && (addr & 0xFF00) == 0xFE00) {
+        m->conf_bytes++;
         return;
     }
 
@@ -128,6 +132,25 @@ void machine_mem_write(void *ctx, u16 addr, u8 data) {
 }
 
 u8 machine_opcode_fetch(void *ctx, u16 addr) {
+    sp_machine_t *m = (sp_machine_t *)ctx;
+
+    /* Detect config loader completion:
+     * Loader reaches RST 38 handler at 0x0038 which contains JP 0x0000.
+     * When PC=0x0038 and conf_loading, loader is done with one bitstream.
+     * Also detect if we've been running too long (>5M tstates = ~700ms). */
+    if (m->conf_loading) {
+        if ((addr == 0x0038 && m->conf_bytes > 1000) ||
+            m->cpu.total_tstates > 5000000) {
+            m->conf_loading = false;
+            /* Switch to BIOS: ROM page 8 at WIN0 */
+            m->page_reg[0] = 0x88;
+            z80_reset(&m->cpu);
+            printf("Boot: Config loader done (%u FPGA bytes, %llu tstates)\n",
+                   m->conf_bytes, (unsigned long long)m->cpu.total_tstates);
+            printf("Boot: Starting BIOS from ROM page 8\n");
+        }
+    }
+
     return machine_mem_read(ctx, addr);
 }
 
@@ -165,7 +188,7 @@ u8 machine_port_read(void *ctx, u16 port) {
         u8 cmos_addr = (port >> 8) & 0xFF;
         /* Return sensible defaults for key CMOS registers */
         switch (cmos_addr) {
-        case 0x0E: return 0x80;  /* Fast boot (skip RAM test), no buzzer */
+        case 0x0E: return 0x00;  /* Full boot with RAM test */
         case 0x0F: return 0x10;  /* Keyboard delay/repeat default */
         case 0x10: return 0x02;  /* Boot device: IDE1 */
         case 0x11: return 0x01;  /* FDD/IDE config */
@@ -218,22 +241,30 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
     /* Port #FE: border + beeper */
     if (lo == 0xFE) { m->port_fe = data; return; }
 
-    /* Port 0x3C: disable BIOS ROM / enable RAM at WIN0 */
-    if (lo == 0x3C) {
-        m->rom_sys = !(data & 0x40);
-        if (m->conf_loading) {
-            /* Configuration loader finished — transition to Phase 2 */
-            m->conf_loading = false;
-            /* Set up normal page mapping: WIN0 = ROM page 0 */
-            m->page_reg[0] = 0x80; /* ROM page 0 */
-            printf("Boot: Configuration phase complete, entering BIOS\n");
-        }
-        return;
-    }
+    /*
+     * Ports 0x3C and 0x7C: ROM/RAM switching for WIN0.
+     * Both matched by (lo & 0xBF) == 0x3C.
+     * From MAME: m_rom_sys = BIT(~offset, 6)
+     *   Port 0x3C (bit6=0): rom_sys=1 → WIN0 = RAM (BIOS ROM disabled)
+     *   Port 0x7C (bit6=1): rom_sys=0 → WIN0 = ROM bank (BIOS ROM enabled)
+     *
+     * When rom_sys=0: WIN0 reads from ROM bank selected by rom_rg
+     * When rom_sys=1: WIN0 reads from RAM page (from ram_pages table)
+     */
+    if ((lo & 0xBF) == 0x3C) {
+        bool new_rom_sys = !(lo & 0x40);  /* 0x3C→true, 0x7C→false */
+        m->rom_sys = new_rom_sys;
 
-    /* Port 0x7C: enable BIOS ROM at WIN0 */
-    if (lo == 0x7C) {
-        m->rom_sys = true;
+        if (!new_rom_sys) {
+            /* ROM mode: map ROM page via rom_rg into WIN0 */
+            u8 rom_page = (m->rom_rg & 0x0F);
+            m->page_reg[0] = 0x80 + rom_page;
+        } else {
+            /* RAM mode: map RAM page from ram_pages table */
+            u8 ram_page = m->ram_pages[0x28]; /* Index 0x28 = port 0xE8 entry */
+            m->page_reg[0] = ram_page;
+        }
+
         return;
     }
 
@@ -456,26 +487,28 @@ void machine_reset(sp_machine_t *m) {
     z80_reset(&m->cpu);
 
     /*
-     * Skip Phase 1 (FPGA bitstream upload). The config loader only writes
-     * bitstream data to memory-mapped FPGA port (0xFE00) — it doesn't
-     * set up RAM. Real data initialization happens in BIOS (ROM page 8).
+     * Phase 1: Run config loader (ROM page 0x0C) to initialize RAM.
+     * The loader writes FPGA bitstream to 0xFE00 (memory-mapped) and
+     * copies critical tables into RAM page 0. We intercept 0xFE00 writes
+     * (don't pollute RAM) and let it run until completion.
      *
-     * Start directly with ROM page 8 which is the real BIOS entry point.
+     * When loader reaches JP 0x0000 (via RST 38 at offset 0x38), or
+     * after a timeout, we switch to Phase 2 with ROM page 8.
      */
-    m->conf_loading = false;
+    m->conf_loading = true;
     m->conf_bytes = 0;
-    m->rom_rg = 0;
+    m->rom_rg = 0x08;
     m->rom_sys = false;
     m->cash_on = false;
     m->dos_mode = true;
+    m->cash_on = false;
+    m->dos_mode = true;
 
-    /* Post-configuration page mapping:
-     * WIN0 = ROM page 8 (BIOS entry: JP 0x00B0 → DI; IM 1; init)
-     * WIN1 = RAM page 5
-     * WIN2 = RAM page 2
-     * WIN3 = RAM page 0
+    /* Config loader page mapping:
+     * WIN0 = ROM page 0x0C (config loader, overridden by conf_loading flag)
+     * WIN3 = RAM page 0 (loader writes DCP/tables here via 0xFE00)
      */
-    m->page_reg[0] = 0x88;  /* ROM page 8 */
+    m->page_reg[0] = 0x8C;  /* ROM page 12 (overridden by conf_loading) */
     m->page_reg[1] = 0x05;  /* RAM page 5 */
     m->page_reg[2] = 0x02;  /* RAM page 2 */
     m->page_reg[3] = 0x00;  /* RAM page 0 */
@@ -497,37 +530,11 @@ void machine_reset(sp_machine_t *m) {
     m->frame_count = 0;
     m->tstates_in_frame = 0;
 
-    /*
-     * Pre-load BIOS resident code into RAM page 0.
-     * The config loader would normally do this, but we skip it.
-     * Copy from ROM page 8 (0x3FD0-0x3FFF) to RAM page 0 (0x3FD0-0x3FFF).
-     * This contains RST vector handlers that switch ROM in/out.
-     * Also copy RST 08 and RST 38 handlers.
-     */
-    if (m->rom) {
-        u32 rom8_base = 8 * ROM_PAGE_SIZE;  /* ROM page 8 offset */
-        /* Copy resident code block: ROM page 8 at 0x3FD0-0x3FFF → RAM page 0 */
-        for (int i = 0x3F00; i < 0x4000; i++) {
-            u8 b = m->rom[rom8_base + i];
-            if (b != 0xFF) /* Skip erased flash bytes */
-                m->ram[i] = b;
-        }
-        /* Also set up RST 08 vector in RAM page 0: JP to BIOS RST8 handler */
-        /* RST 08 at 0x0008: F5 3E 00 D3 7C F1 C9 (push af, LD A,0, OUT 7C, pop af, ret) */
-        /* Actually just copy the first 0x100 bytes from ROM page 8 for all RST vectors */
-        for (int i = 0; i < 0x100; i++) {
-            u8 b = m->rom[rom8_base + i];
-            if (b != 0xFF)
-                m->ram[i] = b;
-        }
-        printf("Boot: Pre-loaded BIOS resident code into RAM page 0\n");
-    }
-
     /* Reset peripherals */
     ctc_reset(&m->ctc);
     sio_reset(&m->sio);
 
-    printf("Boot: Starting BIOS from ROM page 8\n");
+    printf("Boot: Phase 1 — running config loader\n");
 
     bus_reset_all(&m->bus);
 }
