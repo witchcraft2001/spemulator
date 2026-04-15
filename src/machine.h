@@ -1,6 +1,11 @@
 /*
  * SPEmulator — Machine State
- * Central machine state holding all components.
+ *
+ * Architecture follows MAME's sprinter_state closely:
+ * - DCP-based port decoding (256-entry LUT)
+ * - update_memory() recalculates all 4 windows from registers
+ * - VRAM access via PORT_Y * 1024 + (offset & 0x3FF)
+ * - Two-phase boot: conf_loading → soft_reset → normal
  */
 #ifndef SPEMU_MACHINE_H
 #define SPEMU_MACHINE_H
@@ -12,157 +17,128 @@
 #include "cpu/sio.h"
 #include "config.h"
 
-/* Forward declarations */
-typedef struct sp_mmu sp_mmu_t;
-typedef struct sp_video sp_video_t;
-typedef struct sp_keyboard sp_keyboard_t;
-
-/*
- * Sprinter VRAM layout:
- *   Total 256KB organized as lines of 1024 bytes each (256 lines).
- *   Within each 1KB line:
- *     [0x000..0x13F] Screen A pixel data (320 bytes)
- *     [0x140..0x27F] Screen B pixel data (320 bytes)
- *     [0x280..0x2BF] (reserved / game scroll data)
- *     [0x2C0..0x2FF] Character font data (for symbol mode)
- *     [0x300..0x39F] Mode descriptors (4 bytes × 40 tile columns)
- *     [0x3A0..0x3DF] (reserved / interrupt config)
- *     [0x3E0..0x3FF] Palette RGB data (8 entries × 4 bytes)
- *
- *   Mode descriptor (4 bytes per 16×8 tile):
- *     mode[0]: bits 7-6 = palette bank (0-3)
- *              bit  5   = color mode (1=8bpp, 0=4bpp nibbles)
- *              bit  4   = symbol/tile select (1=symbol, 0=tile)
- *              bits 3-0 = tile X offset upper bits
- *     mode[1]: bits 7-3 = tile Y offset
- *              bits 2-0 = tile X offset lower bits
- *     mode[2]: bit  2   = lowres flag (pixel doubling)
- *              bits 1-0 = lowres X/Y suboffset
- *     mode[3]: bits 7-4 = scroll Y, bits 3-0 = scroll X (game mode)
- *
- *   Palette at offset ≥ 0x3E0 within each 1KB line:
- *     pen_index = bits[2:0_of_offset]*256 + (offset >> 10)
- *     3 bytes per entry: R, G, B (each stored as-is, MAME treats as 8-bit)
- */
-
-/* Screen constants matching MAME */
-#define SP_TOTAL_WIDTH    896     /* Total pixels per line (incl. blanking) */
-#define SP_TOTAL_HEIGHT   320     /* Total lines (incl. blanking) */
+/* Screen constants (from MAME) */
+#define SP_TOTAL_WIDTH    896
+#define SP_TOTAL_HEIGHT   320
 #define SP_BORDER_LEFT     48
 #define SP_BORDER_RIGHT    48
 #define SP_BORDER_TOP      16
 #define SP_BORDER_BOTTOM   16
-#define SP_ACTIVE_W       640     /* Max active width */
-#define SP_ACTIVE_H       256     /* Active height */
-#define SP_VIS_W          (SP_BORDER_LEFT + SP_ACTIVE_W + SP_BORDER_RIGHT)   /* 736 */
-#define SP_VIS_H          (SP_BORDER_TOP + SP_ACTIVE_H + SP_BORDER_BOTTOM)   /* 288 */
+#define SP_ACTIVE_W       640
+#define SP_ACTIVE_H       256
+#define SP_VIS_W          (SP_BORDER_LEFT + SP_ACTIVE_W + SP_BORDER_RIGHT)
+#define SP_VIS_H          (SP_BORDER_TOP + SP_ACTIVE_H + SP_BORDER_BOTTOM)
 
-/* VRAM line stride */
+/* VRAM layout */
 #define SP_VRAM_LINE      1024
-/* VRAM total */
 #define SP_VRAM_LINES      256
-/* Mode descriptor offsets within 1KB line */
 #define SP_MODE_OFFSET    0x300
-/* Palette offset within 1KB line */
 #define SP_PAL_OFFSET     0x3E0
-
-/* Number of palette banks × entries */
 #define SP_PAL_BANKS        8
 #define SP_PAL_ENTRIES    256
-#define SP_PAL_TOTAL      (SP_PAL_BANKS * SP_PAL_ENTRIES)  /* 2048 */
+#define SP_PAL_TOTAL      (SP_PAL_BANKS * SP_PAL_ENTRIES)
 
-/* Machine state */
+/* ROM: 256KB = 16 pages of 16KB */
+#define SP_ROM_TOTAL      0x40000
+#define SP_ROM_PAGES      16
+/* FastRAM: 64KB */
+#define SP_FASTRAM_SIZE   0x10000
+/* Config loader ROM page */
+#define SP_ROM_CONF_PAGE  0x0C
+
 typedef struct sp_machine {
-    /* Components */
+    /* CPU and peripherals */
     z80_t          cpu;
-    sp_ctc_t       ctc;        /* Z80-CTC: 4 channels */
-    sp_sio_t       sio;        /* Z80-SIO: 2 channels (KBD + serial) */
+    sp_ctc_t       ctc;
+    sp_sio_t       sio;
     sp_bus_t       bus;
     sp_config_t   *config;
 
-    /* Memory (owned by machine, managed by MMU) */
-    u8            *ram;         /* 4MB RAM */
-    u8            *rom;         /* 256KB ROM (16 × 16KB pages) */
-    u8            *vram;        /* 256KB VRAM (SP_VRAM_LINES * SP_VRAM_LINE) */
-    u8            *fastram;     /* 64KB FastRAM (cache) */
+    /* === Memory === */
+    u8            *ram;       /* 4MB */
+    u8            *rom;       /* 256KB (16 × 16KB pages) */
+    u8            *vram;      /* 256KB (256 × 1KB lines) */
+    u8            *fastram;   /* 64KB */
 
-    /* Boot state: two-phase boot like real Sprinter */
-    bool           conf_loading;  /* Phase 1: config loader running from ROM page 0x0C */
-    u32            conf_bytes;    /* Counter: bytes written to FPGA config port */
-    u8             rom_rg;        /* ROM register: selects which ROM page at WIN0 */
-    bool           rom_sys;       /* ROM system mode */
-    bool           cash_on;       /* FastRAM/cache enabled */
-    bool           dos_mode;      /* DOS active (0=on, 1=off), init=1 */
+    /* Computed memory window pointers (set by update_memory) */
+    u8            *win_rd[4]; /* Read pointers for each 16KB window */
+    u8            *win_wr[4]; /* Write pointers (NULL = read-only) */
+    u8             win_page[4]; /* Effective page number per window */
 
-    /* Memory page registers — port-based (Sprinter native) */
-    u8             page_reg[4]; /* Current page in each window (#82,#A2,#C2,#E2) */
-    /* RAM page table (64 entries, indexed by port hi-nibble) */
+    /* === System registers (from MAME) === */
+    u8             pn;        /* Port #7FFD equivalent */
+    u8             sc;        /* Port #1FFD equivalent */
+    u8             cnf;       /* Config register (DCP bank select bits 3:2) */
+    u8             rom_rg;    /* ROM page register (ports 0x5C, 0x8F) */
+    bool           rom_sys;   /* ROM system mode (ports 0x3C/0x7C) */
+    bool           cash_on;   /* FastRAM/cache enabled (port 0xFB/0x7B) */
+    bool           dos_mode;  /* DOS mode: false=on, true=off */
+    bool           ram_sys;   /* RAM system mode */
+    u8             sys_pg;    /* System page flag for ROM XOR */
+    bool           arom16;    /* AROM16 flag */
+    bool           nmi_ena;   /* NMI enable (active low: 1=disabled) */
+
+    /* RAM page table: 64 entries (virtual ports 0xC0-0xFF) */
     u8             ram_pages[64];
 
-    /* Pentagon/Scorpion compat registers */
-    u8             pn;          /* Pentagon page register (#7FFD) */
-    u8             sc;          /* Scorpion page register (#1FFD) */
+    /* Boot state */
+    bool           conf_loading;  /* Phase 1: FPGA config loading */
+    bool           starting;      /* True until first port read after reset */
+    u32            conf_bytes;    /* Bytes written during conf_loading */
 
-    /* Video state */
-    u8             port_y;      /* PORT_Y register (0xC4/0xCC) */
-    u8             rgmod;       /* RGMOD register (0xC5/0xCD): bit0=screen select */
-    u8             port_fe;     /* Port #FE data (border, beeper, tape) */
-    u8             scroll_reg;  /* Scroll register (port 0xCB) */
-    i16            hold_x;      /* Horizontal scroll offset (derived from scroll_reg) */
-    i16            hold_y;      /* Vertical scroll offset (derived from scroll_reg) */
-    bool           conf_mode;   /* Game configuration mode (Thunder in the Deep) */
+    /* === Video === */
+    u8             port_y;     /* PORT_Y: VRAM Y-address (row for access) */
+    u8             rgmod;      /* RGMOD register */
+    u8             port_fe;    /* Port #FE (border, beeper) */
+    u8             all_mode;   /* ALL_MODE (video mode select) */
+    u8             scroll_reg; /* Scroll register (port 0xCB) */
+    i16            hold_x;
+    i16            hold_y;
+    bool           conf_mode;  /* Game config mode */
 
-    /* Framebuffer for SDL */
+    /* Framebuffer */
     u32           *framebuffer;
-    int            fb_width;    /* = SP_VIS_W */
-    int            fb_height;   /* = SP_VIS_H */
+    int            fb_width;
+    int            fb_height;
 
-    /* Palette cache: 2048 ARGB entries (8 banks × 256 colors)
-     * Rebuilt from VRAM palette area on writes */
+    /* Palette: 2048 ARGB entries */
     u32            palette[SP_PAL_TOTAL];
 
-    /* Accelerator state */
+    /* Accelerator */
     bool           accel_enabled;
     u8             accel_size;
 
-    /* Turbo mode */
+    /* Clock/timing */
     bool           turbo;
     u32            cpu_clock_hz;
-
-    /* Frame timing */
     u64            frame_tstates;
     u64            tstates_in_frame;
     u32            frame_count;
 
-    /* Keyboard state (ZX matrix: 8 half-rows) */
+    /* Keyboard (ZX matrix: 8 half-rows) */
     u8             key_matrix[8];
 
-    /* Running state */
+    /* State */
     bool           running;
     bool           paused;
-
-    /* Debugger active */
     bool           debugger_active;
 } sp_machine_t;
 
-/* Create/destroy machine */
+/* Lifecycle */
 sp_machine_t *machine_create(sp_config_t *config);
 void machine_destroy(sp_machine_t *machine);
-
-/* Reset machine */
 void machine_reset(sp_machine_t *machine);
+int  machine_run_frame(sp_machine_t *machine);
 
-/* Run one frame (returns actual T-states executed) */
-int machine_run_frame(sp_machine_t *machine);
-
-/* Memory access (used as CPU callbacks) */
+/* CPU callbacks */
 u8   machine_mem_read(void *ctx, u16 addr);
 void machine_mem_write(void *ctx, u16 addr, u8 data);
 u8   machine_port_read(void *ctx, u16 port);
 void machine_port_write(void *ctx, u16 port, u8 data);
 u8   machine_opcode_fetch(void *ctx, u16 addr);
-
-/* Accelerator hook */
 int  machine_accel_hook(void *ctx, u8 opcode);
+
+/* Core memory mapping (called when registers change) */
+void update_memory(sp_machine_t *m);
 
 #endif /* SPEMU_MACHINE_H */

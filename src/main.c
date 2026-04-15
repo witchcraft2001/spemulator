@@ -109,14 +109,14 @@ int main(int argc, char **argv) {
             machine_run_frame(machine);
 
             /* Boot status at key frames */
-            if (machine->frame_count == 50 || machine->frame_count == 200 ||
-                machine->frame_count == 500 || machine->frame_count == 1000) {
+            if (machine->frame_count == 50 || machine->frame_count == 500 ||
+                machine->frame_count == 5000 || machine->frame_count == 30000) {
                 printf("F%3d: PC=%04X SP=%04X IFF=%d IM=%d Pg=%02X/%02X/%02X/%02X\n",
                        machine->frame_count,
                        machine->cpu.pc.w, machine->cpu.sp.w,
                        machine->cpu.iff1, machine->cpu.im,
-                       machine->page_reg[0], machine->page_reg[1],
-                       machine->page_reg[2], machine->page_reg[3]);
+                       machine->win_page[0], machine->win_page[1],
+                       machine->win_page[2], machine->win_page[3]);
                 int vram_nz = 0;
                 for (int i = 0; i < SP_VRAM_LINES * SP_VRAM_LINE; i++)
                     if (machine->vram[i]) vram_nz++;

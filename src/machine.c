@@ -1,11 +1,11 @@
 /*
  * SPEmulator — Machine State
  *
- * Two-phase boot (following MAME):
- *   Phase 1 (conf_loading=true): CPU executes from ROM page 0x0C (config loader).
- *     The loader initializes hardware: writes to ports, sets up DCP table in RAM,
- *     copies BIOS code to FastRAM, etc. On completion it transitions to Phase 2.
- *   Phase 2 (conf_loading=false): Normal operation. Memory mapping via page registers.
+ * Implements Sprinter SP2000 architecture following MAME's sprinter_state:
+ * - DCP-based port decoding
+ * - update_memory() recalculates 4 memory windows from registers
+ * - VRAM access via PORT_Y * 1024 + (offset & 0x3FF)
+ * - Two-phase boot: conf_loading → soft_reset → normal BIOS
  */
 #include "machine.h"
 #include "memory/mmu.h"
@@ -19,196 +19,307 @@
 #include <string.h>
 #include <stdio.h>
 
-/* CTC IRQ callback — fires when a CTC channel reaches zero */
+/* ================================================================
+ * Default RAM page table (from MAME machine_start, 64 entries)
+ * Indexed by virtual port 0xC0-0xFF → ram_pages[port - 0xC0]
+ * ================================================================ */
+static const u8 default_ram_pages[64] = {
+    /* 0xC0-0xCF: system port copies */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    /* 0xD0-0xDF: RAM pages */
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+    /* 0xE0-0xEF: ROM/system pages */
+    0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+    0x00, 0x05, 0x02, 0x41, 0xFF, 0x00, 0x00, 0x41,
+    /* 0xF0-0xFF: RAM pages */
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+};
+
+/* ================================================================
+ * CTC IRQ callback
+ * ================================================================ */
 static void ctc_irq_handler(void *ctx, int channel) {
     sp_machine_t *m = (sp_machine_t *)ctx;
-    /* CTC vector = base_vector + channel*2 */
     u8 vector = m->ctc.vector + (u8)(channel * 2);
     z80_irq(&m->cpu, vector);
 }
 
-/* ROM layout: 256KB = 16 pages × 16KB */
-#define ROM_TOTAL_SIZE   0x40000
-#define ROM_PAGE_SIZE    SP_PAGE_SIZE
-#define ROM_NUM_PAGES    (ROM_TOTAL_SIZE / ROM_PAGE_SIZE)
-#define ROM_CONF_PAGE    0x0C  /* Configuration loader at page 12 */
+/* ================================================================
+ * update_memory() — recalculate all 4 memory windows
+ *
+ * Following MAME sprinter_state::update_memory() logic:
+ * WIN0: depends on conf_loading, rom_sys, cash_on, rom_rg
+ * WIN1: ram_pages[0x29] (port 0xE9 entry)
+ * WIN2: ram_pages[0x2A] (port 0xEA entry)
+ * WIN3: page 0x40 during starting, else complex from PN/SC/CNF
+ * ================================================================ */
+static void set_win_rom(sp_machine_t *m, int win, u8 rom_page) {
+    rom_page &= 0x0F;
+    u32 offset = (u32)rom_page * SP_PAGE_SIZE;
+    if (offset + SP_PAGE_SIZE <= SP_ROM_TOTAL)
+        m->win_rd[win] = &m->rom[offset];
+    else
+        m->win_rd[win] = m->rom; /* fallback */
+    m->win_wr[win] = NULL; /* ROM: read-only */
+    m->win_page[win] = 0x80 + rom_page;
+}
 
-/* FastRAM size */
-#define FASTRAM_SIZE     0x10000  /* 64KB */
+static void set_win_ram(sp_machine_t *m, int win, u8 ram_page) {
+    u32 offset = (u32)ram_page * SP_PAGE_SIZE;
+    if (offset + SP_PAGE_SIZE <= SP_RAM_SIZE) {
+        m->win_rd[win] = &m->ram[offset];
+        m->win_wr[win] = &m->ram[offset];
+    } else {
+        m->win_rd[win] = m->ram;
+        m->win_wr[win] = m->ram;
+    }
+    m->win_page[win] = ram_page;
+}
 
-/* Default RAM page table (from MAME machine_start) */
-static const u8 default_ram_pages[64] = {
-    /* 0xC0-0xCF: SYS PORTS COPIES */
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    /* 0xD0-0xDF: RAM PAGES */
-    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-    /* 0xE0-0xEF: ROM PAGES */
-    0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
-    0x00, 0x05, 0x02, 0x41, 0xff, 0x00, 0x00, 0x41,
-    /* 0xF0-0xFF: RAM PAGES */
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-};
+static void set_win_fastram(sp_machine_t *m, int win, u8 fr_page) {
+    u32 offset = (u32)(fr_page & 3) * SP_PAGE_SIZE;
+    if (offset + SP_PAGE_SIZE <= SP_FASTRAM_SIZE) {
+        m->win_rd[win] = &m->fastram[offset];
+        m->win_wr[win] = &m->fastram[offset];
+    } else {
+        m->win_rd[win] = m->fastram;
+        m->win_wr[win] = m->fastram;
+    }
+    m->win_page[win] = 0xF0 + (fr_page & 3); /* pseudo-page for fastram */
+}
 
-/* --- Memory callbacks for Z80 --- */
+/* Calculate WIN3 page from registers (MAME lines 370-389) */
+static u8 calc_win3_page(sp_machine_t *m) {
+    u8 pg3_idx = ((~m->pn >> 7) & 1) << 5
+               | 0x10
+               | ((((m->sc >> 4) & 1) && !((m->cnf >> 7) & 1))
+                 || (((m->cnf >> 7) & 1) && ((m->pn >> 6) & 1))) << 3
+               | (m->pn & 0x07);
+    /* pg3_idx is index into ram_pages, range 0x10-0x3F */
+    pg3_idx &= 0x3F;
+    return m->ram_pages[pg3_idx];
+}
 
-/*
- * Memory read: during conf_loading, WIN0 reads from ROM page ROM_CONF_PAGE.
- * After conf_loading, standard page-register-based mapping.
- */
+void update_memory(sp_machine_t *m) {
+    /* WIN0 */
+    if (m->conf_loading) {
+        /* During config loading: ROM page 0x0C (config loader) */
+        set_win_rom(m, 0, SP_ROM_CONF_PAGE);
+    } else {
+        bool pre_rom = m->rom_sys || m->cash_on;
+        bool pre_cash = !m->cash_on;
+
+        if (!pre_rom && pre_cash) {
+            /* Normal ROM mode: rom_rg XOR sys_pg */
+            u8 rom_page = (m->rom_rg & 0x0F) ^ (m->sys_pg ? 0 : 0x08);
+            set_win_rom(m, 0, rom_page);
+        } else if (pre_rom && !pre_cash) {
+            /* FastRAM mode */
+            set_win_fastram(m, 0, m->rom_rg & 3);
+        } else {
+            /* RAM mode (rom_sys=1, cash_on=0, or both) */
+            /* Simplified: use ram_pages[0x28] (port 0xE8 default) */
+            u8 pg0_idx = 0x28; /* This is a simplification; full calc uses PN/SC/DOS */
+            set_win_ram(m, 0, m->ram_pages[pg0_idx]);
+        }
+    }
+
+    /* WIN1 = ram_pages[0x29] (port 0xE9) */
+    set_win_ram(m, 1, m->ram_pages[0x29]);
+
+    /* WIN2 = ram_pages[0x2A] (port 0xEA) */
+    set_win_ram(m, 2, m->ram_pages[0x2A]);
+
+    /* WIN3: page 0x40 during starting, otherwise from ram_pages or PN/SC calc */
+    if (m->starting) {
+        set_win_ram(m, 3, 0x40);
+    } else {
+        /* Use ram_pages[0x2B] if directly set, otherwise calc from registers */
+        u8 page3 = m->ram_pages[0x2B];
+        if (page3 == 0xFF || page3 == 0x41) {
+            /* Default/unset: calculate from PN/SC/CNF */
+            page3 = calc_win3_page(m);
+        }
+        set_win_ram(m, 3, page3);
+    }
+}
+
+/* ================================================================
+ * Memory read/write with PORT_Y VRAM addressing
+ * ================================================================ */
 u8 machine_mem_read(void *ctx, u16 addr) {
     sp_machine_t *m = (sp_machine_t *)ctx;
     int win = addr >> 14;
+    u16 offset = addr & 0x3FFF;
+    u8 page = m->win_page[win];
 
-    /* During configuration loading, WIN0 reads from ROM conf page */
-    if (win == 0 && m->conf_loading) {
-        u32 rom_offset = (u32)ROM_CONF_PAGE * ROM_PAGE_SIZE + (addr & 0x3FFF);
-        if (rom_offset < ROM_TOTAL_SIZE)
-            return m->rom[rom_offset];
+    /* VRAM pages (0x50-0x5F): access via PORT_Y addressing */
+    if ((page & 0xF0) == 0x50) {
+        u32 vaddr = (u32)m->port_y * SP_VRAM_LINE + (offset & 0x3FF);
+        if (vaddr < SP_VRAM_SIZE)
+            return m->vram[vaddr];
         return 0xFF;
     }
 
-    u8 page = m->page_reg[win];
-
-    /* ROM pages: 0x80+ maps to ROM */
-    if (page >= 0x80) {
-        u32 phys = ((u32)(page - 0x80) << 14) | (addr & 0x3FFF);
-        if (phys < ROM_TOTAL_SIZE)
-            return m->rom[phys];
-        return 0xFF;
-    }
-
-    /* RAM pages */
-    u32 phys = ((u32)page << 14) | (addr & 0x3FFF);
-    if (phys < SP_RAM_SIZE)
-        return m->ram[phys];
-    return 0xFF;
+    return m->win_rd[win] ? m->win_rd[win][offset] : 0xFF;
 }
 
 void machine_mem_write(void *ctx, u16 addr, u8 data) {
     sp_machine_t *m = (sp_machine_t *)ctx;
     int win = addr >> 14;
+    u16 offset = addr & 0x3FFF;
+    u8 page = m->win_page[win];
 
-    /* During configuration loading, WIN0 writes are ignored (ROM area) */
-    if (win == 0 && m->conf_loading)
-        return;
-
-    /* During conf loading, intercept WIN3 writes at 0xFE00-0xFEFF:
-     * FPGA config memory-mapped port. Bitstream bytes written here via
-     * repeated LD (DE),A; RRCA pattern should not go to RAM.
-     * But other WIN3 writes (loader copying tables) should pass through. */
-    if (m->conf_loading && win == 3) {
-        u16 win3_offset = addr & 0x3FFF;
-        if (win3_offset >= 0x3E00 && win3_offset <= 0x3EFF) {
-            /* FPGA config port area — count but don't store */
-            m->conf_bytes++;
-            return;
+    /* During conf_loading: writes to bootstrap area → fastram + counting */
+    if (m->conf_loading) {
+        /* All writes during conf_loading go to fastram */
+        u32 fr_offset = addr & 0xFFFF;
+        if (fr_offset < SP_FASTRAM_SIZE) {
+            m->fastram[fr_offset] = data;
         }
-        /* Other WIN3 writes pass through normally */
-    }
+        m->conf_bytes++;
 
-    u8 page = m->page_reg[win];
-
-    /* ROM write-protected */
-    if (page >= 0x80) return;
-
-    u32 phys = ((u32)page << 14) | (addr & 0x3FFF);
-
-    /* VRAM pages #50-#5F */
-    if (page >= 0x50 && page <= 0x5F) {
-        u8 transp = (page >> 3) & 1;
-        u8 shadow = (page >> 2) & 1;
-        u32 vram_offset = ((u32)(page & 0x03) << 14) | (addr & 0x3FFF);
-
-        if (transp && data == 0xFF) return;
-
-        if (vram_offset < SP_VRAM_SIZE) {
-            m->vram[vram_offset] = data;
-            video_on_vram_write(m, vram_offset, data);
+        /* After 4096+ bytes: config complete → soft reset */
+        if (m->conf_bytes > 0xFFF) {
+            m->conf_loading = false;
+            printf("Boot: FPGA config complete (%u bytes), triggering soft reset\n",
+                   m->conf_bytes);
+            /* Soft reset: re-initialize with conf_loading=false */
+            z80_reset(&m->cpu);
+            m->starting = true;
+            m->conf_bytes = 0;
+            update_memory(m);
+            printf("Boot: Phase 2 — BIOS from ROM page %d\n",
+                   m->win_page[0] & 0x0F);
         }
-        if (!shadow && phys < SP_RAM_SIZE)
-            m->ram[phys] = data;
         return;
     }
 
-    if (phys < SP_RAM_SIZE)
-        m->ram[phys] = data;
+    /* VRAM pages (0x50-0x5F): PORT_Y addressing with mode bits */
+    if ((page & 0xF0) == 0x50) {
+        u8 transp = (page >> 3) & 1;  /* bit 3: transparency */
+        u8 shadow = (page >> 2) & 1;  /* bit 2: VRAM-only (shadow) */
+
+        if (transp && data == 0xFF) return; /* Skip transparent bytes */
+
+        u32 vaddr = (u32)m->port_y * SP_VRAM_LINE + (offset & 0x3FF);
+
+        /* Write to VRAM (always unless shadow says no) */
+        if (vaddr < SP_VRAM_SIZE) {
+            m->vram[vaddr] = data;
+            video_on_vram_write(m, vaddr, data);
+        }
+
+        /* Also write to RAM (unless VRAM-only mode) */
+        if (!shadow && m->win_wr[win]) {
+            m->win_wr[win][offset] = data;
+        }
+        return;
+    }
+
+    /* Normal RAM write */
+    if (m->win_wr[win]) {
+        m->win_wr[win][offset] = data;
+    }
 }
 
 u8 machine_opcode_fetch(void *ctx, u16 addr) {
-
     return machine_mem_read(ctx, addr);
 }
 
-/* --- Port I/O --- */
+/* ================================================================
+ * Port I/O — DCP-based decoding
+ *
+ * MAME approach: ports 0x3C/0x7C are special-cased before DCP.
+ * Then DCP LUT maps the port to a virtual number.
+ * Virtual ports 0xC0-0xFF → ram_pages[] writes.
+ * Other virtual ports → specific hardware handlers.
+ *
+ * Simplified: we decode ports by lo byte matching MAME's dcp_w/dcp_r
+ * switch statements directly.
+ * ================================================================ */
 
 u8 machine_port_read(void *ctx, u16 port) {
     sp_machine_t *m = (sp_machine_t *)ctx;
     u8 lo = port & 0xFF;
 
-    /* Page register reads */
-    if (lo == SP_PORT_PAGE0) return m->page_reg[0];
-    if (lo == SP_PORT_PAGE1) return m->page_reg[1];
-    if (lo == SP_PORT_PAGE2) return m->page_reg[2];
-    if (lo == SP_PORT_PAGE3) return m->page_reg[3];
+    /* First port read clears starting flag (MAME: dcp_r line 579) */
+    if (m->starting) {
+        m->starting = false;
+        update_memory(m);
+    }
 
-    /* Video registers */
-    if (lo == 0xC4 || lo == 0xCC) return m->port_y;
-    if (lo == 0xC5 || lo == 0xCD) return m->rgmod;
+    /* === Direct-decoded ports (not through DCP) === */
 
-    /* CTC ports (0x10-0x13) */
-    if (lo >= 0x10 && lo <= 0x13)
-        return ctc_read(&m->ctc, lo - 0x10);
+    /* CTC (Z84C15 internal: 0x10-0x13) */
+    if (lo >= 0x10 && lo <= 0x13) return ctc_read(&m->ctc, lo - 0x10);
 
-    /* SIO ports: 0x18 = CH-A data (keyboard), 0x19 = CH-A ctrl,
-     *            0x1A = CH-B data (serial), 0x1B = CH-B ctrl */
+    /* SIO (Z84C15 internal: 0x18-0x1B) */
     if (lo == 0x18) return sio_read_data(&m->sio, 0);
     if (lo == 0x19) return sio_read_ctrl(&m->sio, 0);
     if (lo == 0x1A) return sio_read_data(&m->sio, 1);
     if (lo == 0x1B) return sio_read_ctrl(&m->sio, 1);
 
-    /* CMOS/RTC: port 0x1C reads data at selected CMOS address.
-     * The high byte of the port address is the CMOS register index
-     * (set by previous OUT to port 0x1C where A=register). */
+    /* CMOS/RTC (port 0x1C: data read, address from high byte) */
     if (lo == 0x1C) {
         u8 cmos_addr = (port >> 8) & 0xFF;
-        /* Return sensible defaults for key CMOS registers */
         switch (cmos_addr) {
-        case 0x0E: return 0x00;  /* Full boot with RAM test */
-        case 0x0F: return 0x10;  /* Keyboard delay/repeat default */
-        case 0x10: return 0x00;  /* Boot device: FDD1 (0=FDD1, 2=IDE1, 4=ROM) */
-        case 0x11: return 0x01;  /* FDD/IDE config */
-        case 0x1B: return 0x00;  /* Hardware config: normal speed */
-        default: return 0x00;
+        case 0x0E: return 0x80; /* Fast boot (skip RAM test) */
+        case 0x0F: return 0x10; /* Keyboard delay */
+        case 0x10: return 0x00; /* Boot: FDD1 */
+        case 0x11: return 0x01; /* FDD/IDE config */
+        case 0x1B: return 0x00; /* Normal speed */
+        default:   return 0x00;
         }
     }
 
-    /* Port 0x00 with various high bytes: general port read */
-    if (lo == 0x00) return 0xFF;
-
-    /* Keyboard: port #FE (ZX matrix) */
+    /* Port #FE: keyboard matrix */
     if (lo == 0xFE) {
         u8 result = 0xFF;
         u8 rows = ~(port >> 8);
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < 8; i++)
             if (rows & (1 << i))
                 result &= m->key_matrix[i];
-        }
         return result;
     }
 
-    /* IDE ports: return "no device" for all IDE register reads.
-     * Read ports: 0x0050-0x0057, status: 0x4053.
-     * No device: status=0x00 (BSY=0, RDY=0), error=0x00 */
+    /* === DCP-decoded ports (simplified matching MAME dcp_r switch) === */
+
+    /* System port reads: ram_pages values */
+    if (lo >= 0xC0) {
+        u8 idx = lo - 0xC0;
+        /* Some system ports return register values */
+        switch (lo) {
+        case 0xC0: return m->sc;        /* 1FFD */
+        case 0xC1: return m->pn;        /* 7FFD */
+        case 0xC3: return m->all_mode;  /* ALL_MODE */
+        case 0xC4: case 0xCC: return m->port_y;
+        case 0xC5: case 0xCD: return m->rgmod;
+        default:
+            if (idx < 64) return m->ram_pages[idx];
+            return 0xFF;
+        }
+    }
+
+    /* IDE: no device present */
     if (lo >= 0x50 && lo <= 0x57) return 0x00;
 
-    /* Beta disk / FDD ports (WD1793): 0x1F, 0x3F, 0x5F, 0x7F, 0xFF
-     * Status register: bit 7 = not ready, others = 0 */
-    if (lo == 0x1F) return 0x80; /* WD1793 status: not ready */
+    /* FDD (WD1793): not ready */
+    if (lo == 0x1F) return 0x80;
     if (lo == 0x3F || lo == 0x5F || lo == 0x7F) return 0x00;
-    if (lo == 0xFF) return 0x00; /* System register */
+
+    /* AY read */
+    if (lo == 0x8D || lo == 0x8E) return 0xFF;
+
+    /* cash_on control via port read (MAME: dcp_r line 585) */
+    if ((lo & 0x7F) == 0x7B) {
+        m->cash_on = (port >> 7) & 1;
+        update_memory(m);
+        return 0xFF;
+    }
 
     return bus_port_read(&m->bus, port);
 }
@@ -217,185 +328,164 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
     sp_machine_t *m = (sp_machine_t *)ctx;
     u8 lo = port & 0xFF;
 
-    /* Page registers */
-    if (lo == SP_PORT_PAGE0) {
-        m->page_reg[0] = data;
-        /* When BIOS switches WIN0 to RAM page (< 0x80), copy the ENTIRE
-         * ROM page 8 content into that RAM page. In real Sprinter, the FPGA
-         * config loader prepares RAM with a copy of the BIOS code so that
-         * after OUT(#82,page), execution continues seamlessly in RAM. */
-        if (data < 0x80 && m->rom) {
-            u32 rom8 = 8 * ROM_PAGE_SIZE;
-            u32 ram_base = (u32)data * ROM_PAGE_SIZE;
-            if (ram_base + ROM_PAGE_SIZE <= SP_RAM_SIZE) {
-                memcpy(&m->ram[ram_base], &m->rom[rom8], ROM_PAGE_SIZE);
-            }
-        }
-        return;
-    }
-    if (lo == SP_PORT_PAGE1) { m->page_reg[1] = data; return; }
-    if (lo == SP_PORT_PAGE2) { m->page_reg[2] = data; return; }
-    if (lo == SP_PORT_PAGE3) { m->page_reg[3] = data; return; }
+    /* During starting, I/O writes are ignored (MAME: dcp_w line 702) */
+    if (m->starting) return;
 
-    /* Video registers */
-    if (lo == 0xC4 || lo == 0xCC) { m->port_y = data; return; }
-    if (lo == 0xC5 || lo == 0xCD) { m->rgmod = data; return; }
-    if (lo == 0xCB) {
-        m->scroll_reg = data;
-        m->hold_x = (i16)((7 - (data & 0x0F)) * 2);
-        m->hold_y = (i16)(7 - (data >> 4));
-        return;
-    }
-
-    /* Port #FE: border + beeper */
-    if (lo == 0xFE) { m->port_fe = data; return; }
-
-    /*
-     * Ports 0x3C and 0x7C: ROM/RAM switching for WIN0.
-     * Both matched by (lo & 0xBF) == 0x3C.
-     * From MAME: m_rom_sys = BIT(~offset, 6)
-     *   Port 0x3C (bit6=0): rom_sys=1 → WIN0 = RAM (BIOS ROM disabled)
-     *   Port 0x7C (bit6=1): rom_sys=0 → WIN0 = ROM bank (BIOS ROM enabled)
-     *
-     * When rom_sys=0: WIN0 reads from ROM bank selected by rom_rg
-     * When rom_sys=1: WIN0 reads from RAM page (from ram_pages table)
-     */
+    /* === Special-cased ports (before DCP): 0x3C/0x7C === */
     if ((lo & 0xBF) == 0x3C) {
-        bool new_rom_sys = !(lo & 0x40);  /* 0x3C→true, 0x7C→false */
-        m->rom_sys = new_rom_sys;
-
-        if (!new_rom_sys) {
-            /* ROM mode: map ROM page via rom_rg into WIN0 */
-            u8 rom_page = (m->rom_rg & 0x0F);
-            m->page_reg[0] = 0x80 + rom_page;
-        } else {
-            /* RAM mode: map RAM page from ram_pages table */
-            u8 ram_page = m->ram_pages[0x28]; /* Index 0x28 = port 0xE8 entry */
-            m->page_reg[0] = ram_page;
-        }
-
+        /* Port 0x3C: rom_sys=1 (RAM/FastRAM at WIN0)
+         * Port 0x7C: rom_sys=0 (ROM at WIN0) */
+        m->rom_sys = !((lo >> 6) & 1);  /* bit6: 0→rom_sys=1, 1→rom_sys=0 */
+        if (!(data & 0x02))
+            m->sys_pg = ((m->rom_rg >> 4) & 1) || (data & 1);
+        update_memory(m);
         return;
     }
 
-    /* Port 0xFB: enable FastRAM/cache */
-    if (lo == 0xFB) { m->cash_on = (port >> 7) & 1; return; }
-    /* Port 0x7B: disable FastRAM */
-    if (lo == 0x7B) { m->cash_on = false; return; }
-
-    /* Pentagon page register #7FFD */
-    if (port == 0x7FFD) { m->pn = data; return; }
-    /* Scorpion page register #1FFD */
-    if (port == 0x1FFD) { m->sc = data; return; }
-
-    /* FPGA configuration port (0xEF via BC=xxEF OUT (C),r) —
-     * Count writes; after enough bytes, skip to Phase 2 */
-    if (lo == 0xEF && m->conf_loading) {
-        m->conf_bytes++;
-        /* Real ACEX 1K30 bitstream is ~40KB. After enough bytes, skip. */
-        if (m->conf_bytes >= 40000) {
-            m->conf_loading = false;
-            /* Switch WIN0 to ROM page 0 for normal BIOS execution */
-            m->page_reg[0] = 0x80;
-            /* Reset CPU to start from 0x0000 (now ROM page 0) */
-            z80_reset(&m->cpu);
-            /* Set up standard post-config page mapping */
-            m->page_reg[0] = 0x80; /* ROM page 0 */
-            m->page_reg[1] = 0x02; /* RAM page 2 */
-            m->page_reg[2] = 0x0A; /* RAM page 10 */
-            m->page_reg[3] = 0x00; /* RAM page 0 */
-            printf("Boot: Phase 2 — FPGA configured (%u bytes), entering BIOS\n",
-                   m->conf_bytes);
-        }
+    /* Port 0x5C: ROM register (only when rom_sys=0) */
+    if (lo == 0x5C && !m->rom_sys) {
+        m->rom_rg = data;
+        m->sys_pg |= (m->rom_rg >> 4) & 1;
+        update_memory(m);
         return;
     }
 
-    /* CTC ports (0x10-0x13) */
-    if (lo >= 0x10 && lo <= 0x13) {
-        ctc_write(&m->ctc, lo - 0x10, data);
-        return;
-    }
+    /* === Direct-decoded ports === */
 
-    /* SIO ports */
+    /* CTC */
+    if (lo >= 0x10 && lo <= 0x13) { ctc_write(&m->ctc, lo - 0x10, data); return; }
+    /* SIO */
     if (lo == 0x18) { sio_write_data(&m->sio, 0, data); return; }
     if (lo == 0x19) { sio_write_ctrl(&m->sio, 0, data); return; }
     if (lo == 0x1A) { sio_write_data(&m->sio, 1, data); return; }
     if (lo == 0x1B) { sio_write_ctrl(&m->sio, 1, data); return; }
+    /* CMOS */
+    if (lo == 0x1C || lo == 0x1D || lo == 0x1E) return;
+    /* Port #FE */
+    if (lo == 0xFE) { m->port_fe = data; return; }
 
-    /* CMOS: port 0x1C write = address (via OUT (n),A: hi byte = A, lo = 0x1C) */
-    if (lo == 0x1C) return;  /* Address write, absorbed */
-    /* CMOS: port 0x1D = address write, 0x1E = data write */
-    if (lo == 0x1D || lo == 0x1E) return;
+    /* === Sprinter page register ports (DCP-decoded in real HW) ===
+     * These are written via OUT(n),A where port = (A<<8)|n.
+     * Ports 0x82/0xA2/0xC2/0xE2 map to specific ram_pages indices.
+     * In the real DCP, these go through the LUT, but we handle directly. */
+    if (lo == 0x82) { m->ram_pages[0x28] = data; update_memory(m); return; } /* WIN0 (when in RAM mode) */
+    if (lo == 0xA2) { m->ram_pages[0x29] = data; update_memory(m); return; } /* WIN1 */
+    if (lo == 0xC2 && (port >> 8) != 0x00) { /* 0xC2 with non-zero A = page write, not border */
+        m->ram_pages[0x2A] = data; update_memory(m); return;
+    }
+    if (lo == 0xE2) { m->ram_pages[0x2B] = data; update_memory(m); return; } /* WIN3 direct */
 
-    /* Port 0xEE/0xEF: FPGA config — absorb */
+    /* === DCP-decoded system ports 0xC0-0xFF → ram_pages writes === */
+    if (lo >= 0xC0) {
+        u8 idx = lo - 0xC0;
+        switch (lo) {
+        case 0xC0: /* 1FFD (SC register) */
+            m->sc = data;
+            update_memory(m);
+            return;
+        case 0xC1: /* 7FFD (PN register) */
+            m->pn = data;
+            update_memory(m);
+            return;
+        case 0xC2: /* Border / ZX video */
+            m->port_fe = (m->port_fe & 0xF8) | (data & 0x07);
+            return;
+        case 0xC3: /* ALL_MODE */
+            m->all_mode = data;
+            return;
+        case 0xC4: case 0xCC: /* PORT_Y */
+            m->port_y = data;
+            return;
+        case 0xC5: case 0xCD: /* RGMOD */
+            m->rgmod = data;
+            return;
+        case 0xC6: case 0xCE: /* CNF/SYS */
+            m->ram_sys = !((lo >> 6) & 1);
+            if (data & 0x04) m->cnf = data;
+            if (data & 0x02) m->turbo = data & 1;
+            else m->arom16 = data & 1;
+            update_memory(m);
+            return;
+        case 0xCB: /* Scroll */
+            m->scroll_reg = data;
+            m->hold_x = (i16)((7 - (data & 0x0F)) * 2);
+            m->hold_y = (i16)(7 - (data >> 4));
+            return;
+        default:
+            /* All other 0xC0-0xFF: write to ram_pages table */
+            if (idx < 64) {
+                m->ram_pages[idx] = data;
+                update_memory(m);
+            }
+            return;
+        }
+    }
+
+    /* Port 0x8F: ROM/FastRAM page register (alternate) */
+    if (lo == 0x8F) {
+        m->rom_rg = data;
+        update_memory(m);
+        return;
+    }
+
+    /* Port 0x89: PORT_Y (also used for COVOX mode) */
+    if (lo == 0x89) { m->port_y = data; return; }
+
+    /* FPGA config ports */
     if (lo == 0xEE || lo == 0xEF) return;
-
-    /* IDE write ports: absorb (0x50-0x57 with various hi bytes) */
+    /* IDE write ports */
     if (lo >= 0x50 && lo <= 0x57) return;
-
-    /* Beta disk / FDD write ports */
+    /* FDD write ports */
     if (lo == 0x1F || lo == 0x3F || lo == 0x5F || lo == 0x7F || lo == 0xFF) return;
-
     /* AY ports */
     if (lo == 0x8D || lo == 0x8E) return;
 
     bus_port_write(&m->bus, port, data);
 }
 
-/* --- Accelerator hook --- */
-
+/* ================================================================
+ * Accelerator hook
+ * ================================================================ */
 int machine_accel_hook(void *ctx, u8 opcode) {
     sp_machine_t *m = (sp_machine_t *)ctx;
     if (!m->accel_enabled) return 0;
-
     z80_t *cpu = &m->cpu;
 
     switch (opcode) {
     case 0x40: m->accel_enabled = false; return 0;
     case 0x52: m->accel_size = Z80_A; return 0;
-
-    case 0x49: { /* Fill block */
-        u16 addr = Z80_HL;
-        u8 val = Z80_A;
-        int count = m->accel_size ? m->accel_size : 256;
-        for (int i = 0; i < count; i++)
-            machine_mem_write(m, addr++, val);
-        Z80_HL = addr;
-        return count;
+    case 0x49: { /* Fill */
+        u16 a = Z80_HL; u8 v = Z80_A;
+        int n = m->accel_size ? m->accel_size : 256;
+        for (int i = 0; i < n; i++) machine_mem_write(m, a++, v);
+        Z80_HL = a; return n;
     }
     case 0x5B: { /* Vertical fill */
-        u16 addr = Z80_HL;
-        u8 val = Z80_A;
-        int count = Z80_A;
-        for (int i = 0; i < count; i++) {
-            machine_mem_write(m, addr, val);
-            addr += 320;
-        }
-        return count * 2;
+        u16 a = Z80_HL; u8 v = Z80_A; int n = Z80_A;
+        for (int i = 0; i < n; i++) { machine_mem_write(m, a, v); a += 320; }
+        return n * 2;
     }
     case 0x6D: { /* Copy row */
-        u16 src = Z80_HL, dst = Z80_DE;
-        int count = m->accel_size ? m->accel_size : 256;
-        for (int i = 0; i < count; i++) {
-            u8 v = machine_mem_read(m, src++);
-            machine_mem_write(m, dst++, v);
-        }
-        Z80_HL = src; Z80_DE = dst;
-        return count;
+        u16 s = Z80_HL, d = Z80_DE;
+        int n = m->accel_size ? m->accel_size : 256;
+        for (int i = 0; i < n; i++) machine_mem_write(m, d++, machine_mem_read(m, s++));
+        Z80_HL = s; Z80_DE = d; return n;
     }
     case 0x7F: { /* Copy vertical */
-        u16 src = Z80_HL, dst = Z80_DE;
-        int count = Z80_A;
-        for (int i = 0; i < count; i++) {
-            machine_mem_write(m, dst, machine_mem_read(m, src));
-            src += 320; dst += 320;
+        u16 s = Z80_HL, d = Z80_DE; int n = Z80_A;
+        for (int i = 0; i < n; i++) {
+            machine_mem_write(m, d, machine_mem_read(m, s));
+            s += 320; d += 320;
         }
-        return count * 2;
+        return n * 2;
     }
     }
     return 0;
 }
 
-/* --- Machine lifecycle --- */
+/* ================================================================
+ * Machine lifecycle
+ * ================================================================ */
 
 static int load_rom(sp_machine_t *m, const char *path) {
     if (!path || !path[0]) {
@@ -410,48 +500,41 @@ static int load_rom(sp_machine_t *m, const char *path) {
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-
-    if (sz > ROM_TOTAL_SIZE) sz = ROM_TOTAL_SIZE;
+    if (sz > (long)SP_ROM_TOTAL) sz = SP_ROM_TOTAL;
     size_t n = fread(m->rom, 1, (size_t)sz, f);
     fclose(f);
-    printf("Loaded ROM: %s (%zu bytes, %zu pages)\n", path, n, n / ROM_PAGE_SIZE);
+    printf("Loaded ROM: %s (%zu bytes, %zu pages)\n", path, n, n / SP_PAGE_SIZE);
     return 0;
 }
 
 sp_machine_t *machine_create(sp_config_t *config) {
     sp_machine_t *m = calloc(1, sizeof(sp_machine_t));
     if (!m) return NULL;
-
     m->config = config;
 
     /* Allocate memory */
     m->ram = calloc(1, SP_RAM_SIZE);
-    m->rom = malloc(ROM_TOTAL_SIZE);
+    m->rom = malloc(SP_ROM_TOTAL);
     m->vram = calloc(1, SP_VRAM_LINES * SP_VRAM_LINE);
-    m->fastram = calloc(1, FASTRAM_SIZE);
+    m->fastram = calloc(1, SP_FASTRAM_SIZE);
     if (!m->ram || !m->rom || !m->vram || !m->fastram) {
         fprintf(stderr, "Error: Failed to allocate memory\n");
         machine_destroy(m);
         return NULL;
     }
-
-    /* Fill ROM with 0xFF (erased flash state) */
-    memset(m->rom, 0xFF, ROM_TOTAL_SIZE);
+    memset(m->rom, 0xFF, SP_ROM_TOTAL);
 
     /* Framebuffer */
     m->fb_width = SP_VIS_W;
     m->fb_height = SP_VIS_H;
     m->framebuffer = calloc((size_t)m->fb_width * m->fb_height, sizeof(u32));
     if (!m->framebuffer) {
-        fprintf(stderr, "Error: Failed to allocate framebuffer\n");
         machine_destroy(m);
         return NULL;
     }
 
-    /* Initialize bus */
+    /* Initialize bus, CPU, peripherals */
     bus_init(&m->bus, m);
-
-    /* Initialize Z80 */
     z80_init(&m->cpu);
     m->cpu.mem_read = machine_mem_read;
     m->cpu.mem_write = machine_mem_write;
@@ -462,13 +545,12 @@ sp_machine_t *machine_create(sp_config_t *config) {
     m->cpu.accel_hook = machine_accel_hook;
     m->cpu.accel_ctx = m;
 
-    memset(m->key_matrix, 0xFF, sizeof(m->key_matrix));
-
-    /* Initialize CTC and SIO */
     ctc_init(&m->ctc);
     m->ctc.irq_callback = ctc_irq_handler;
     m->ctc.irq_ctx = m;
     sio_init(&m->sio);
+
+    memset(m->key_matrix, 0xFF, sizeof(m->key_matrix));
 
     /* Load ROM */
     load_rom(m, config->rom_path);
@@ -476,13 +558,12 @@ sp_machine_t *machine_create(sp_config_t *config) {
     /* Initialize palette */
     palette_init_default(m);
 
-    /* Set clock */
+    /* Clock */
     m->turbo = (config->cpu_speed_mhz >= 21);
     m->cpu_clock_hz = m->turbo ? SP_CPU_TURBO_HZ : SP_CPU_NORMAL_HZ;
     m->frame_tstates = m->cpu_clock_hz / SP_FRAME_RATE_PAL;
 
     m->running = true;
-
     machine_reset(m);
     return m;
 }
@@ -501,31 +582,32 @@ void machine_destroy(sp_machine_t *m) {
 void machine_reset(sp_machine_t *m) {
     z80_reset(&m->cpu);
 
-    /*
-     * Phase 1: Run config loader (ROM page 0x0C) to initialize RAM.
-     * Skip FPGA config loader. Pre-copy BIOS resident code from ROM page 8
-     * into RAM page 0 (see below). Start BIOS execution from ROM page 8.
-     */
-    m->conf_loading = false;
+    /* Boot state: Phase 1 = config loading */
+    m->conf_loading = true;
+    m->starting = true;
     m->conf_bytes = 0;
-    m->rom_rg = 0x08;
+
+    /* Register defaults (MAME machine_reset) */
+    m->rom_rg = 0x00;
     m->rom_sys = false;
     m->cash_on = false;
-    m->dos_mode = true;
-
-    m->page_reg[0] = 0x88;  /* ROM page 8 (BIOS entry) */
-    m->page_reg[1] = 0x05;  /* RAM page 5 */
-    m->page_reg[2] = 0x02;  /* RAM page 2 */
-    m->page_reg[3] = 0x00;  /* RAM page 0 */
+    m->dos_mode = true; /* DOS off */
+    m->ram_sys = false;
+    m->sys_pg = 0;
+    m->arom16 = false;
+    m->nmi_ena = true; /* NMI disabled */
+    m->pn = 0x00;
+    m->sc = 0x00;
+    m->cnf = 0x00;
 
     /* Initialize RAM page table */
     memcpy(m->ram_pages, default_ram_pages, sizeof(default_ram_pages));
 
+    /* Video */
     m->port_y = 0;
     m->rgmod = 0;
     m->port_fe = 0;
-    m->pn = 0;
-    m->sc = 0;
+    m->all_mode = 0;
     m->scroll_reg = 0;
     m->hold_x = 0;
     m->hold_y = 0;
@@ -535,28 +617,15 @@ void machine_reset(sp_machine_t *m) {
     m->frame_count = 0;
     m->tstates_in_frame = 0;
 
-    /*
-     * Pre-initialize RAM page 0 with BIOS resident code from ROM page 8.
-     * In real Sprinter this is done by the FPGA config loader.
-     * We copy: RST vectors (0x0000-0x0070), dispatch table (0x0800-0x0FFF),
-     * and resident code (0x3F00-0x3FFF).
-     */
-    if (m->rom) {
-        u32 rom8 = 8 * ROM_PAGE_SIZE;
-        /* Copy RST vectors and early code (0x0000-0x00FF) */
-        memcpy(&m->ram[0x0000], &m->rom[rom8 + 0x0000], 0x0100);
-        /* Copy dispatch table area (0x0400-0x0FFF) */
-        memcpy(&m->ram[0x0400], &m->rom[rom8 + 0x0400], 0x0C00);
-        /* Copy resident code area (0x3F00-0x3FFF) */
-        memcpy(&m->ram[0x3F00], &m->rom[rom8 + 0x3F00], 0x0100);
-        printf("Boot: Copied BIOS resident data from ROM page 8 → RAM page 0\n");
-    }
-
     /* Reset peripherals */
     ctc_reset(&m->ctc);
     sio_reset(&m->sio);
 
-    printf("Boot: Phase 1 — running config loader\n");
+    /* Calculate initial memory mapping */
+    update_memory(m);
+
+    printf("Boot: Phase 1 — config loader from ROM page %d\n",
+           m->win_page[0] & 0x0F);
 
     bus_reset_all(&m->bus);
 }
@@ -574,7 +643,7 @@ int machine_run_frame(sp_machine_t *m) {
         executed += t;
         m->cpu.total_tstates += t;
 
-        /* Clock CTC periodically (every ~100 T-states for efficiency) */
+        /* Clock CTC */
         m->tstates_in_frame += t;
         if (m->tstates_in_frame >= 100) {
             ctc_clock(&m->ctc, (int)m->tstates_in_frame);
@@ -582,8 +651,7 @@ int machine_run_frame(sp_machine_t *m) {
         }
     }
 
-    /* VSync: generate interrupt at end of frame ONLY if CPU is ready.
-     * Don't stack IRQs — only fire if previous one was serviced. */
+    /* VSync IRQ (IM1: vector 0xFF) */
     if (m->cpu.iff1 && !m->cpu.irq_pending) {
         z80_irq(&m->cpu, 0xFF);
     }

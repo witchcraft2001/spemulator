@@ -27,7 +27,7 @@ typedef int64_t   i64;
 
 #define SP_PAGE_SIZE       0x4000   /* 16KB per page */
 #define SP_RAM_PAGES          256   /* 4MB = 256 * 16KB */
-#define SP_ROM_PAGES           32   /* 512KB ROM/Flash */
+/* SP_ROM_PAGES defined in machine.h as 16 (256KB actual ROM) */
 #define SP_VRAM_SIZE      0x40000   /* 256KB VRAM */
 #define SP_RAM_SIZE      (SP_RAM_PAGES * SP_PAGE_SIZE)  /* 4MB */
 #define SP_ROM_SIZE      (SP_ROM_PAGES * SP_PAGE_SIZE)  /* 512KB */
@@ -38,11 +38,10 @@ typedef int64_t   i64;
 #define SP_WIN2_BASE    0x8000
 #define SP_WIN3_BASE    0xC000
 
-/* Page register ports */
-#define SP_PORT_PAGE0   0x82
-#define SP_PORT_PAGE1   0xA2
-#define SP_PORT_PAGE2   0xC2
-#define SP_PORT_PAGE3   0xE2
+/* Page register ports (decoded via DCP, not hardcoded)
+ * These are in the 0xC0-0xFF DCP system port range.
+ * Virtual ports: 0xE8=WIN0, 0xE9=WIN1, 0xEA=WIN2
+ * WIN3 is calculated from PN/SC/CNF registers */
 
 /* Video ports */
 #define SP_PORT_Y       0x89
