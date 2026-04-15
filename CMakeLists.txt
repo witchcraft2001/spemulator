@@ -9,8 +9,14 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG")
+set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG -DSPEMU_TRACE")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
+
+# Option to enable trace in release builds
+option(SPEMU_ENABLE_TRACE "Enable trace logging in release builds" OFF)
+if(SPEMU_ENABLE_TRACE)
+    add_definitions(-DSPEMU_TRACE)
+endif()
 
 # Find SDL3
 find_package(SDL3 REQUIRED)
@@ -62,6 +68,7 @@ set(SOURCES
     src/debug/debugger.c
     src/debug/breakpoint.c
     src/debug/dbg_ui.c
+    src/debug/trace.c
     src/platform/platform.c
     src/platform/sdl_backend.c
 )

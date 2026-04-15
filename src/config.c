@@ -42,6 +42,8 @@ void config_print_usage(const char *argv0) {
         "  --fullscreen       Start in fullscreen\n"
         "  --debug            Start with debugger open\n"
         "  --turbo            Start in turbo mode (21MHz)\n"
+        "  --trace [spec]     Enable trace logging to stderr\n"
+        "                     spec: all,default,io,port,page,irq,boot,cmos,cpu,mem\n"
         "  --help             Show this help\n",
         argv0);
 }
@@ -81,6 +83,14 @@ int config_parse_args(sp_config_t *cfg, int argc, char **argv) {
             cfg->start_debugger = true;
         else if (strcmp(argv[i], "--turbo") == 0)
             cfg->cpu_speed_mhz = 21;
+        else if (strcmp(argv[i], "--trace") == 0) {
+            cfg->trace_enabled = true;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                strncpy(cfg->trace_spec, argv[++i], sizeof(cfg->trace_spec) - 1);
+            } else {
+                strncpy(cfg->trace_spec, "default", sizeof(cfg->trace_spec) - 1);
+            }
+        }
         else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             config_print_usage(argv[0]);

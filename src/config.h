@@ -34,6 +34,8 @@ typedef struct sp_config {
 
     /* Debug */
     bool start_debugger;
+    bool trace_enabled;
+    char trace_spec[256];  /* Trace category spec: "all", "io,page", etc. */
 
     /* Config file path */
     char config_path[SP_MAX_PATH];

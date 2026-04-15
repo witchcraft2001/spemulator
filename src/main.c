@@ -9,6 +9,7 @@
 #include "platform/sdl_backend.h"
 #include "platform/platform.h"
 #include "debug/debugger.h"
+#include "debug/trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,9 @@ int main(int argc, char **argv) {
     printf("SPEmulator — Sprinter SP2000 Emulator\n");
     printf("Platform: %s\n\n", platform_name());
 
+    /* Initialize trace system */
+    trace_init(&g_trace);
+
     sp_config_t *config = config_create();
     if (!config) { fprintf(stderr, "Failed to create config\n"); return 1; }
 
@@ -25,6 +29,14 @@ int main(int argc, char **argv) {
     if (config_parse_args(config, argc, argv) < 0) {
         config_destroy(config);
         return 1;
+    }
+
+    /* Set up trace if requested */
+    if (config->trace_enabled) {
+        g_trace.enabled = true;
+        trace_parse_spec(&g_trace, config->trace_spec);
+        fprintf(stderr, "Trace enabled: mask=0x%04X spec=%s\n",
+                g_trace.mask, config->trace_spec);
     }
 
     sp_machine_t *machine = machine_create(config);
@@ -94,9 +106,10 @@ int main(int argc, char **argv) {
             machine_run_frame(machine);
 
             /* Boot trace */
-            if (machine->frame_count == 1000 ||
-                machine->frame_count == 10000 ||
+            if (machine->frame_count == 10000 ||
                 machine->frame_count == 50000 ||
+                machine->frame_count == 70000 ||
+                machine->frame_count == 100000 ||
                 machine->frame_count == 200000) {
                 printf("F%5d: PC=%04X SP=%04X IFF=%d Pg=%02X/%02X/%02X/%02X ts=%lluM\n",
                        machine->frame_count,

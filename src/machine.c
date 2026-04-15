@@ -15,6 +15,7 @@
 #include "input/keyboard.h"
 #include "cpu/ctc.h"
 #include "cpu/sio.h"
+#include "debug/trace.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -133,6 +134,11 @@ void update_memory(sp_machine_t *m) {
     /* WIN2 = ram_pages[0x2A] (port 0xEA) */
     set_win_ram(m, 2, m->ram_pages[0x2A]);
 
+    TRACE_PAGE(m->cpu.total_tstates, m->cpu.pc.w, 0, m->win_page[0],
+               m->win_wr[0] ? "RW" : "RO");
+    TRACE_PAGE(m->cpu.total_tstates, m->cpu.pc.w, 1, m->win_page[1], "RW");
+    TRACE_PAGE(m->cpu.total_tstates, m->cpu.pc.w, 2, m->win_page[2], "RW");
+
     /* WIN3: page 0x40 during starting, otherwise from ram_pages or PN/SC calc */
     if (m->starting) {
         set_win_ram(m, 3, 0x40);
@@ -145,6 +151,8 @@ void update_memory(sp_machine_t *m) {
         }
         set_win_ram(m, 3, page3);
     }
+    TRACE_PAGE(m->cpu.total_tstates, m->cpu.pc.w, 3, m->win_page[3],
+               m->starting ? "START" : "RW");
 }
 
 /* ================================================================
@@ -185,6 +193,8 @@ void machine_mem_write(void *ctx, u16 addr, u8 data) {
         /* After 4096+ bytes: config complete → soft reset */
         if (m->conf_bytes > 0xFFF) {
             m->conf_loading = false;
+            TRACE_BOOT(m->cpu.total_tstates, m->cpu.pc.w,
+                       "FPGA config complete (%u bytes), soft reset", m->conf_bytes);
             printf("Boot: FPGA config complete (%u bytes), triggering soft reset\n",
                    m->conf_bytes);
             /* Soft reset: re-initialize with conf_loading=false */
@@ -227,6 +237,7 @@ void machine_mem_write(void *ctx, u16 addr, u8 data) {
 }
 
 u8 machine_opcode_fetch(void *ctx, u16 addr) {
+    sp_machine_t *m = (sp_machine_t *)ctx;
     return machine_mem_read(ctx, addr);
 }
 
@@ -248,6 +259,8 @@ u8 machine_port_read(void *ctx, u16 port) {
 
     /* First port read clears starting flag (MAME: dcp_r line 579) */
     if (m->starting) {
+        TRACE_BOOT(m->cpu.total_tstates, m->cpu.pc.w,
+                   "starting cleared by port READ %04X", (unsigned)port);
         m->starting = false;
         update_memory(m);
     }
@@ -263,9 +276,23 @@ u8 machine_port_read(void *ctx, u16 port) {
     if (lo == 0x1A) return sio_read_data(&m->sio, 1);
     if (lo == 0x1B) return sio_read_ctrl(&m->sio, 1);
 
-    /* CMOS/RTC: port 0x1C = data read at current CMOS address */
+    /* CMOS/RTC: port 0x1C = data read (DCP: CMOS_DAT_RD)
+     * Only treat as CMOS when high byte suggests actual CMOS access.
+     * For IN A,(#1C) the port is (A<<8)|0x1C — high byte varies.
+     * For IN A,(C) with BC set to specific CMOS port — also handled. */
     if (lo == 0x1C) {
-        return m->cmos_data[m->cmos_addr];
+        u8 val = rtc_read(&m->rtc);
+        TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
+                   "RD addr=%02X val=%02X", m->rtc.addr_reg, val);
+        return val;
+    }
+
+    /* ISA CMOS ports: IN A,(C) with BC=0xFFBD → CMOS data read */
+    if (lo == 0xBD && (port & 0xFF00) == 0xFF00) {
+        u8 val = rtc_read(&m->rtc);
+        TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
+                   "ISA RD addr=%02X val=%02X", m->rtc.addr_reg, val);
+        return val;
     }
 
     /* Port #FE: keyboard matrix */
@@ -313,16 +340,24 @@ u8 machine_port_read(void *ctx, u16 port) {
         return 0xFF;
     }
 
-    return bus_port_read(&m->bus, port);
+    {
+        u8 val = bus_port_read(&m->bus, port);
+        TRACE_PORT_R(m->cpu.total_tstates, m->cpu.pc.w, port, val);
+        return val;
+    }
 }
 
 void machine_port_write(void *ctx, u16 port, u8 data) {
     sp_machine_t *m = (sp_machine_t *)ctx;
     u8 lo = port & 0xFF;
+    TRACE_PORT_W(m->cpu.total_tstates, m->cpu.pc.w, port, data);
 
     /* During starting, I/O writes clear starting flag but are processed.
      * In real DCP, starting clears on first non-memory bus cycle. */
     if (m->starting) {
+        TRACE_BOOT(m->cpu.total_tstates, m->cpu.pc.w,
+                   "starting cleared by port WRITE %04X=%02X",
+                   (unsigned)port, (unsigned)data);
         m->starting = false;
         update_memory(m);
     }
@@ -355,32 +390,62 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
     if (lo == 0x19) { sio_write_ctrl(&m->sio, 0, data); return; }
     if (lo == 0x1A) { sio_write_data(&m->sio, 1, data); return; }
     if (lo == 0x1B) { sio_write_ctrl(&m->sio, 1, data); return; }
-    /* CMOS: 0x1C = data write AND address (via OUT(n),A where A=addr or data)
-     * In Sprinter, port 0x1C handles BOTH address and data.
-     * The DCP.MIF says: 0x1C=CMOS_DAT_RD, 0x1D=CMOS_ADR_WR, 0x1E=CMOS_DAT_WR
-     * But BIOS uses OUT(#1C),A for BOTH setting address and writing data.
-     * Convention: writes to 0x1C set the CMOS address (for next read),
-     * writes to 0x1E write data to current address. */
+    /* CMOS ports (DCP: 0x1C=DAT_RD, 0x1D=ADR_WR, 0x1E=DAT_WR)
+     * Port 0x1C is CMOS_DAT_RD — writes to it are NOT CMOS operations.
+     * The BIOS uses OUT(#1C),A with various A values for DCP page config,
+     * not for CMOS access. CMOS address is set via port 0x1D only.
+     * CMOS data writes go through port 0x1E. */
     if (lo == 0x1C) {
-        /* Address write — next read from 0x1C will return cmos_data[data] */
-        m->cmos_addr = data;
+        /* NOT a CMOS operation — DCP page configuration or no-op.
+         * On real hardware, OUT(#1C),A goes through DCP which may
+         * reconfigure memory pages based on the full 16-bit port address.
+         * TODO: implement DCP page switching for different A values. */
+        TRACE(TR_PORT_W, m->cpu.total_tstates, m->cpu.pc.w,
+              "PW %04X=%02X (port 1C write, not CMOS)", (unsigned)port, (unsigned)data);
         return;
     }
-    if (lo == 0x1D) { m->cmos_addr = data; return; }
-    if (lo == 0x1E) { m->cmos_data[m->cmos_addr] = data; return; }
+    if (lo == 0x1D) {
+        TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
+                   "ADR=%02X", data);
+        rtc_write_addr(&m->rtc, data);
+        return;
+    }
+    if (lo == 0x1E) {
+        TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
+                   "WR addr=%02X val=%02X", m->rtc.addr_reg, data);
+        rtc_write_data(&m->rtc, data);
+        return;
+    }
+
+    /* ISA CMOS ports: OUT(C),A with BC=0xDFBD → address, 0xBFBD → data write */
+    if (lo == 0xBD) {
+        u8 hi = (port >> 8) & 0xFF;
+        if (hi == 0xDF || (hi & 0xE0) == 0xC0) {
+            /* CMOS_AWR: address write */
+            TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
+                       "ISA ADR=%02X", data);
+            rtc_write_addr(&m->rtc, data);
+            return;
+        }
+        if (hi == 0xBF || (hi & 0xE0) == 0xA0) {
+            /* CMOS_DWR: data write */
+            TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
+                       "ISA WR addr=%02X val=%02X", m->rtc.addr_reg, data);
+            rtc_write_data(&m->rtc, data);
+            return;
+        }
+    }
     /* Port #FE */
     if (lo == 0xFE) { m->port_fe = data; return; }
 
     /* === Sprinter page register ports (DCP-decoded in real HW) ===
-     * These are written via OUT(n),A where port = (A<<8)|n.
-     * Ports 0x82/0xA2/0xC2/0xE2 map to specific ram_pages indices.
-     * In the real DCP, these go through the LUT, but we handle directly. */
+     * Ports 0x82/0xA2 are below 0xC0, need explicit handlers.
+     * They map through DCP to modify WIN0/WIN1 page registers.
+     * Ports 0xC2/0xE2 are in the 0xC0+ system port range and are
+     * handled by the system port default handler via ram_pages[lo-0xC0].
+     * update_memory() reads from ram_pages[0x28-0x2B] for WIN0-WIN3. */
     if (lo == 0x82) { m->ram_pages[0x28] = data; update_memory(m); return; } /* WIN0 (when in RAM mode) */
     if (lo == 0xA2) { m->ram_pages[0x29] = data; update_memory(m); return; } /* WIN1 */
-    if (lo == 0xC2 && (port >> 8) != 0x00) { /* 0xC2 with non-zero A = page write, not border */
-        m->ram_pages[0x2A] = data; update_memory(m); return;
-    }
-    if (lo == 0xE2) { m->ram_pages[0x2B] = data; update_memory(m); return; }
 
     /* === DCP-decoded system ports 0xC0-0xFF → ram_pages writes === */
     if (lo >= 0xC0) {
@@ -556,6 +621,7 @@ sp_machine_t *machine_create(sp_config_t *config) {
     m->ctc.irq_callback = ctc_irq_handler;
     m->ctc.irq_ctx = m;
     sio_init(&m->sio);
+    rtc_init(&m->rtc);
 
     memset(m->key_matrix, 0xFF, sizeof(m->key_matrix));
 
@@ -610,14 +676,8 @@ void machine_reset(sp_machine_t *m) {
     /* Initialize RAM page table */
     memcpy(m->ram_pages, default_ram_pages, sizeof(default_ram_pages));
 
-    /* CMOS defaults */
-    m->cmos_addr = 0;
-    memset(m->cmos_data, 0, sizeof(m->cmos_data));
-    m->cmos_data[0x0E] = 0x80; /* Fast boot (skip RAM test) */
-    m->cmos_data[0x0F] = 0x10; /* Keyboard delay */
-    m->cmos_data[0x10] = 0x00; /* Boot device: FDD1 */
-    m->cmos_data[0x11] = 0x01; /* FDD/IDE config */
-    m->cmos_data[0x1B] = 0x00; /* Hardware: normal speed */
+    /* RTC/CMOS reset */
+    rtc_reset(&m->rtc);
 
     /* Video */
     m->port_y = 0;
@@ -663,8 +723,12 @@ int machine_run_frame(sp_machine_t *m) {
     /* Clock CTC once per frame */
     ctc_clock(&m->ctc, frame_ts);
 
+    /* Tick RTC (UIP simulation) */
+    rtc_tick(&m->rtc);
+
     /* VSync IRQ (IM1: vector 0xFF) */
     if (m->cpu.iff1 && !m->cpu.irq_pending) {
+        TRACE_IRQ(m->cpu.total_tstates, m->cpu.pc.w, 0xFF);
         z80_irq(&m->cpu, 0xFF);
     }
 

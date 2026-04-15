@@ -15,6 +15,7 @@
 #include "cpu/z80.h"
 #include "cpu/ctc.h"
 #include "cpu/sio.h"
+#include "periph/rtc.h"
 #include "config.h"
 
 /* Screen constants (from MAME) */
@@ -115,9 +116,8 @@ typedef struct sp_machine {
     u64            tstates_in_frame;
     u32            frame_count;
 
-    /* CMOS/RTC */
-    u8             cmos_addr;     /* Current CMOS address register */
-    u8             cmos_data[256]; /* CMOS RAM */
+    /* CMOS/RTC (DS12887) */
+    sp_rtc_t       rtc;
 
     /* Keyboard (ZX matrix: 8 half-rows) */
     u8             key_matrix[8];
