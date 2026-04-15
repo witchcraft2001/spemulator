@@ -15,6 +15,60 @@ typedef struct sp_mmu sp_mmu_t;
 typedef struct sp_video sp_video_t;
 typedef struct sp_keyboard sp_keyboard_t;
 
+/*
+ * Sprinter VRAM layout:
+ *   Total 256KB organized as lines of 1024 bytes each (256 lines).
+ *   Within each 1KB line:
+ *     [0x000..0x13F] Screen A pixel data (320 bytes)
+ *     [0x140..0x27F] Screen B pixel data (320 bytes)
+ *     [0x280..0x2BF] (reserved / game scroll data)
+ *     [0x2C0..0x2FF] Character font data (for symbol mode)
+ *     [0x300..0x39F] Mode descriptors (4 bytes × 40 tile columns)
+ *     [0x3A0..0x3DF] (reserved / interrupt config)
+ *     [0x3E0..0x3FF] Palette RGB data (8 entries × 4 bytes)
+ *
+ *   Mode descriptor (4 bytes per 16×8 tile):
+ *     mode[0]: bits 7-6 = palette bank (0-3)
+ *              bit  5   = color mode (1=8bpp, 0=4bpp nibbles)
+ *              bit  4   = symbol/tile select (1=symbol, 0=tile)
+ *              bits 3-0 = tile X offset upper bits
+ *     mode[1]: bits 7-3 = tile Y offset
+ *              bits 2-0 = tile X offset lower bits
+ *     mode[2]: bit  2   = lowres flag (pixel doubling)
+ *              bits 1-0 = lowres X/Y suboffset
+ *     mode[3]: bits 7-4 = scroll Y, bits 3-0 = scroll X (game mode)
+ *
+ *   Palette at offset ≥ 0x3E0 within each 1KB line:
+ *     pen_index = bits[2:0_of_offset]*256 + (offset >> 10)
+ *     3 bytes per entry: R, G, B (each stored as-is, MAME treats as 8-bit)
+ */
+
+/* Screen constants matching MAME */
+#define SP_TOTAL_WIDTH    896     /* Total pixels per line (incl. blanking) */
+#define SP_TOTAL_HEIGHT   320     /* Total lines (incl. blanking) */
+#define SP_BORDER_LEFT     48
+#define SP_BORDER_RIGHT    48
+#define SP_BORDER_TOP      16
+#define SP_BORDER_BOTTOM   16
+#define SP_ACTIVE_W       640     /* Max active width */
+#define SP_ACTIVE_H       256     /* Active height */
+#define SP_VIS_W          (SP_BORDER_LEFT + SP_ACTIVE_W + SP_BORDER_RIGHT)   /* 736 */
+#define SP_VIS_H          (SP_BORDER_TOP + SP_ACTIVE_H + SP_BORDER_BOTTOM)   /* 288 */
+
+/* VRAM line stride */
+#define SP_VRAM_LINE      1024
+/* VRAM total */
+#define SP_VRAM_LINES      256
+/* Mode descriptor offsets within 1KB line */
+#define SP_MODE_OFFSET    0x300
+/* Palette offset within 1KB line */
+#define SP_PAL_OFFSET     0x3E0
+
+/* Number of palette banks × entries */
+#define SP_PAL_BANKS        8
+#define SP_PAL_ENTRIES    256
+#define SP_PAL_TOTAL      (SP_PAL_BANKS * SP_PAL_ENTRIES)  /* 2048 */
+
 /* Machine state */
 typedef struct sp_machine {
     /* Components */
@@ -25,22 +79,32 @@ typedef struct sp_machine {
     /* Memory (owned by machine, managed by MMU) */
     u8            *ram;         /* 4MB RAM */
     u8            *rom;         /* 512KB ROM */
-    u8            *vram;        /* 256KB VRAM */
+    u8            *vram;        /* 256KB VRAM (SP_VRAM_LINES * SP_VRAM_LINE) */
 
     /* Memory page registers */
     u8             page_reg[4]; /* Current page in each window (#82,#A2,#C2,#E2) */
 
-    /* Video state */
-    u8             video_mode;  /* 0=ZX, 1=320x256, 2=640x256 */
-    u8             port_y;      /* PORT_Y register */
-    u8             rgmod;       /* RGMOD register */
-    u8             border_color;
-    u32           *framebuffer; /* ARGB framebuffer for SDL */
-    int            fb_width;
-    int            fb_height;
+    /* Pentagon/Scorpion compat registers */
+    u8             pn;          /* Pentagon page register (#7FFD) */
+    u8             sc;          /* Scorpion page register (#1FFD) */
 
-    /* Palette: 256 entries, each is 0x00RRGGBB */
-    u32            palette[256];
+    /* Video state */
+    u8             port_y;      /* PORT_Y register (0xC4/0xCC) */
+    u8             rgmod;       /* RGMOD register (0xC5/0xCD): bit0=screen select */
+    u8             port_fe;     /* Port #FE data (border, beeper, tape) */
+    u8             scroll_reg;  /* Scroll register (port 0xCB) */
+    i16            hold_x;      /* Horizontal scroll offset (derived from scroll_reg) */
+    i16            hold_y;      /* Vertical scroll offset (derived from scroll_reg) */
+    bool           conf_mode;   /* Game configuration mode (Thunder in the Deep) */
+
+    /* Framebuffer for SDL */
+    u32           *framebuffer;
+    int            fb_width;    /* = SP_VIS_W */
+    int            fb_height;   /* = SP_VIS_H */
+
+    /* Palette cache: 2048 ARGB entries (8 banks × 256 colors)
+     * Rebuilt from VRAM palette area on writes */
+    u32            palette[SP_PAL_TOTAL];
 
     /* Accelerator state */
     bool           accel_enabled;
@@ -51,8 +115,8 @@ typedef struct sp_machine {
     u32            cpu_clock_hz;
 
     /* Frame timing */
-    u64            frame_tstates;     /* T-states per frame */
-    u64            tstates_in_frame;  /* T-states elapsed in current frame */
+    u64            frame_tstates;
+    u64            tstates_in_frame;
     u32            frame_count;
 
     /* Keyboard state (ZX matrix: 8 half-rows) */

@@ -100,9 +100,9 @@ void debugger_print_regs(sp_debugger_t *dbg, sp_machine_t *m) {
     printf("I=%02X R=%02X IM=%d IFF1=%d IFF2=%d %s\n",
            cpu->i, (cpu->r & 0x7F) | (cpu->r7 & 0x80), cpu->im,
            cpu->iff1, cpu->iff2, cpu->halted ? "HALTED" : "");
-    printf("Pages: W0=#%02X W1=#%02X W2=#%02X W3=#%02X  Mode=%d\n",
+    printf("Pages: W0=#%02X W1=#%02X W2=#%02X W3=#%02X  RGMOD=%02X PN=%02X\n",
            m->page_reg[0], m->page_reg[1], m->page_reg[2], m->page_reg[3],
-           m->video_mode);
+           m->rgmod, m->pn);
 }
 
 void debugger_print_disasm(sp_debugger_t *dbg, sp_machine_t *m, u16 addr, int lines) {

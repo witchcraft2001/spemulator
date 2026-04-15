@@ -1,6 +1,10 @@
 /*
  * SPEmulator — Palette Management
- * Sprinter: 256 colors, 6-6-6 RGB encoding.
+ *
+ * Sprinter palette: 8 banks × 256 colors = 2048 entries.
+ * Stored in VRAM at offset ≥ 0x3E0 within each 1KB line.
+ * Each entry = 3 bytes (R, G, B). MAME stores them as raw 8-bit values.
+ * The FPGA interprets them (likely 6-bit DAC, but stored as 8-bit in VRAM).
  */
 #ifndef SPEMU_PALETTE_H
 #define SPEMU_PALETTE_H
@@ -9,10 +13,10 @@
 
 typedef struct sp_machine sp_machine_t;
 
-/* Set palette entry: index, 6-bit R, G, B */
-void palette_set(sp_machine_t *m, u8 index, u8 r6, u8 g6, u8 b6);
+/* Rebuild entire palette cache from current VRAM contents */
+void palette_rebuild(sp_machine_t *m);
 
-/* Initialize default Sprinter palette */
+/* Initialize palette to default ZX Spectrum colors for bank 0 */
 void palette_init_default(sp_machine_t *m);
 
 #endif /* SPEMU_PALETTE_H */

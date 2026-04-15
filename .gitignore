@@ -1,0 +1,30 @@
+# Build
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Binary
+spemulator
+spemulator.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ROM files (user-provided)
+roms/*.rom
+roms/*.bin

@@ -4,6 +4,7 @@
 #include "machine.h"
 #include "memory/mmu.h"
 #include "video/video.h"
+#include "video/palette.h"
 #include "video/accel.h"
 #include "input/keyboard.h"
 #include <stdlib.h>
@@ -19,14 +20,12 @@ u8 machine_mem_read(void *ctx, u16 addr) {
     u32 phys;
 
     if (page >= 0x80) {
-        /* ROM space */
         phys = ((u32)(page - 0x80) << 14) | (addr & 0x3FFF);
         if (phys < SP_ROM_SIZE)
             return m->rom[phys];
         return 0xFF;
     }
 
-    /* RAM space */
     phys = ((u32)page << 14) | (addr & 0x3FFF);
     if (phys < SP_RAM_SIZE)
         return m->ram[phys];
@@ -38,40 +37,33 @@ void machine_mem_write(void *ctx, u16 addr, u8 data) {
     int win = addr >> 14;
     u8 page = m->page_reg[win];
 
-    /* ROM pages are write-protected */
-    if (page >= 0x80) return;
+    if (page >= 0x80) return; /* ROM write-protected */
 
     u32 phys = ((u32)page << 14) | (addr & 0x3FFF);
 
-    /* Check if writing to VRAM pages */
+    /* VRAM pages #50-#5F */
     if (page >= 0x50 && page <= 0x5F) {
-        u8 vram_mode = (page >> 2) & 0x03;
+        /*
+         * Page #5X: X = %TSPP
+         *   T (bit 3): transparency (skip 0xFF)
+         *   S (bit 2): shadow/VRAM-only (don't write DRAM)
+         *   PP (bits 1-0): VRAM section offset
+         */
+        u8 transp = (page >> 3) & 1;
+        u8 shadow = (page >> 2) & 1;
         u32 vram_offset = ((u32)(page & 0x03) << 14) | (addr & 0x3FFF);
 
-        switch (vram_mode) {
-        case 0: /* Normal: write to both VRAM and DRAM */
-            if (vram_offset < SP_VRAM_SIZE)
-                m->vram[vram_offset] = data;
-            if (phys < SP_RAM_SIZE)
-                m->ram[phys] = data;
-            return;
-        case 1: /* VRAM-only */
-            if (vram_offset < SP_VRAM_SIZE)
-                m->vram[vram_offset] = data;
-            return;
-        case 2: /* Transparent: skip 0xFF */
-            if (data != 0xFF) {
-                if (vram_offset < SP_VRAM_SIZE)
-                    m->vram[vram_offset] = data;
-                if (phys < SP_RAM_SIZE)
-                    m->ram[phys] = data;
-            }
-            return;
-        case 3: /* Sprite: transparent + VRAM-only */
-            if (data != 0xFF && vram_offset < SP_VRAM_SIZE)
-                m->vram[vram_offset] = data;
-            return;
+        if (transp && data == 0xFF)
+            return; /* Transparent: skip 0xFF bytes */
+
+        if (vram_offset < SP_VRAM_SIZE) {
+            m->vram[vram_offset] = data;
+            video_on_vram_write(m, vram_offset, data);
         }
+        if (!shadow && phys < SP_RAM_SIZE) {
+            m->ram[phys] = data;
+        }
+        return;
     }
 
     if (phys < SP_RAM_SIZE)
@@ -79,26 +71,25 @@ void machine_mem_write(void *ctx, u16 addr, u8 data) {
 }
 
 u8 machine_opcode_fetch(void *ctx, u16 addr) {
-    /* Same as mem_read for now; M1 cycle detection can be added later */
     return machine_mem_read(ctx, addr);
 }
 
 u8 machine_port_read(void *ctx, u16 port) {
     sp_machine_t *m = (sp_machine_t *)ctx;
+    u8 lo = port & 0xFF;
 
     /* Page register reads */
-    u8 lo = port & 0xFF;
     if (lo == SP_PORT_PAGE0) return m->page_reg[0];
     if (lo == SP_PORT_PAGE1) return m->page_reg[1];
     if (lo == SP_PORT_PAGE2) return m->page_reg[2];
     if (lo == SP_PORT_PAGE3) return m->page_reg[3];
 
-    /* Video port reads */
-    if (lo == SP_PORT_ALLMODE) return m->video_mode;
-    if (lo == SP_PORT_RGMOD)   return m->rgmod;
+    /* Video registers */
+    if (lo == 0xC4 || lo == 0xCC) return m->port_y;
+    if (lo == 0xC5 || lo == 0xCD) return m->rgmod;
 
     /* Keyboard: port #FE (ZX matrix) */
-    if ((port & 0xFF) == 0xFE) {
+    if (lo == 0xFE) {
         u8 result = 0xFF;
         u8 rows = ~(port >> 8);
         for (int i = 0; i < 8; i++) {
@@ -108,7 +99,6 @@ u8 machine_port_read(void *ctx, u16 port) {
         return result;
     }
 
-    /* Delegate to bus */
     return bus_port_read(&m->bus, port);
 }
 
@@ -122,18 +112,30 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
     if (lo == SP_PORT_PAGE2) { m->page_reg[2] = data; return; }
     if (lo == SP_PORT_PAGE3) { m->page_reg[3] = data; return; }
 
-    /* Video mode */
-    if (lo == SP_PORT_ALLMODE) { m->video_mode = data & 0x03; return; }
-    if (lo == SP_PORT_RGMOD)   { m->rgmod = data; return; }
-    if (lo == SP_PORT_Y)       { m->port_y = data; return; }
+    /* Video registers */
+    if (lo == 0xC4 || lo == 0xCC) { m->port_y = data; return; }
+    if (lo == 0xC5 || lo == 0xCD) { m->rgmod = data; return; }
 
-    /* Border color (port #FE) */
-    if ((port & 0xFF) == 0xFE) {
-        m->border_color = data & 0x07;
+    /* Scroll register (port 0xCB) — from MAME: hold = {(7-(data&0xf))*2, 7-(data>>4)} */
+    if (lo == 0xCB) {
+        m->scroll_reg = data;
+        m->hold_x = (i16)((7 - (data & 0x0F)) * 2);
+        m->hold_y = (i16)(7 - (data >> 4));
         return;
     }
 
-    /* Delegate to bus */
+    /* Port #FE: border color + beeper */
+    if (lo == 0xFE) {
+        m->port_fe = data;
+        return;
+    }
+
+    /* Pentagon page register #7FFD */
+    if (port == 0x7FFD) {
+        m->pn = data;
+        return;
+    }
+
     bus_port_write(&m->bus, port, data);
 }
 
@@ -163,17 +165,16 @@ int machine_accel_hook(void *ctx, u8 opcode) {
             addr++;
         }
         Z80_HL = addr;
-        /* At 42MHz, each byte takes ~1 cycle = ~6 CPU cycles at 7MHz */
-        return count; /* approximate T-states */
+        return count;
     }
 
     case 0x5B: { /* LD E,E — vertical fill */
         u16 addr = Z80_HL;
         u8 val = Z80_A;
-        int count = Z80_A; /* height */
+        int count = Z80_A;
         for (int i = 0; i < count; i++) {
             machine_mem_write(m, addr, val);
-            addr += 320; /* next line in 320-mode */
+            addr += 320;
         }
         return count * 2;
     }
@@ -194,7 +195,7 @@ int machine_accel_hook(void *ctx, u8 opcode) {
     case 0x7F: { /* LD A,A — copy vertical */
         u16 src = Z80_HL;
         u16 dst = Z80_DE;
-        int count = Z80_A; /* height */
+        int count = Z80_A;
         for (int i = 0; i < count; i++) {
             u8 v = machine_mem_read(m, src);
             machine_mem_write(m, dst, v);
@@ -235,17 +236,17 @@ sp_machine_t *machine_create(sp_config_t *config) {
     /* Allocate memory */
     m->ram = calloc(1, SP_RAM_SIZE);
     m->rom = calloc(1, SP_ROM_SIZE);
-    m->vram = calloc(1, SP_VRAM_SIZE);
+    m->vram = calloc(1, SP_VRAM_LINES * SP_VRAM_LINE);
     if (!m->ram || !m->rom || !m->vram) {
         fprintf(stderr, "Error: Failed to allocate memory\n");
         machine_destroy(m);
         return NULL;
     }
 
-    /* Framebuffer: max resolution 640+border*2 x 256+border*2 */
-    m->fb_width = SP_SCREEN_W_640 + SP_BORDER_SIZE * 2;
-    m->fb_height = SP_SCREEN_H_640 + SP_BORDER_SIZE * 2;
-    m->framebuffer = calloc(m->fb_width * m->fb_height, sizeof(u32));
+    /* Framebuffer: visible area */
+    m->fb_width = SP_VIS_W;
+    m->fb_height = SP_VIS_H;
+    m->framebuffer = calloc((size_t)m->fb_width * m->fb_height, sizeof(u32));
     if (!m->framebuffer) {
         fprintf(stderr, "Error: Failed to allocate framebuffer\n");
         machine_destroy(m);
@@ -272,20 +273,8 @@ sp_machine_t *machine_create(sp_config_t *config) {
     /* Load ROM */
     load_rom(m, config->rom_path);
 
-    /* Initialize default palette (ZX Spectrum colors + grayscale ramp) */
-    static const u32 zx_colors[16] = {
-        0x000000, 0x0000C0, 0xC00000, 0xC000C0,
-        0x00C000, 0x00C0C0, 0xC0C000, 0xC0C0C0,
-        0x000000, 0x0000FF, 0xFF0000, 0xFF00FF,
-        0x00FF00, 0x00FFFF, 0xFFFF00, 0xFFFFFF,
-    };
-    for (int i = 0; i < 16; i++)
-        m->palette[i] = zx_colors[i];
-    /* Fill remaining with grayscale ramp */
-    for (int i = 16; i < 256; i++) {
-        u8 g = (u8)i;
-        m->palette[i] = (g << 16) | (g << 8) | g;
-    }
+    /* Initialize palette with defaults */
+    palette_init_default(m);
 
     /* Set clock */
     m->turbo = (config->cpu_speed_mhz >= 21);
@@ -317,10 +306,15 @@ void machine_reset(sp_machine_t *m) {
     m->page_reg[2] = 0x0A;  /* WIN2 = RAM page 10 */
     m->page_reg[3] = 0x00;  /* WIN3 = RAM page 0 */
 
-    m->video_mode = SP_VMODE_ZX;
     m->port_y = 0xC0;
     m->rgmod = 0;
-    m->border_color = 0;
+    m->port_fe = 0;
+    m->pn = 0;
+    m->sc = 0;
+    m->scroll_reg = 0x77; /* default: hold_x=0, hold_y=0 */
+    m->hold_x = 0;
+    m->hold_y = 0;
+    m->conf_mode = false;
     m->accel_enabled = false;
     m->accel_size = 0;
     m->frame_count = 0;
