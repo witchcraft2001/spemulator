@@ -144,8 +144,15 @@ u8 machine_port_read(void *ctx, u16 port) {
     if (lo == 0x18) return 0;   /* No keyboard data */
     if (lo == 0x19) return 0;   /* SIO status: no data ready */
 
-    /* CMOS/RTC */
-    if (lo == 0x1C) return 0;   /* RTC data - stub */
+    /* CMOS/RTC: port 0x1C reads data at selected CMOS address */
+    if (lo == 0x1C) {
+        /* Return CMOS data at current address register */
+        /* For now return sensible defaults */
+        return 0x00;
+    }
+
+    /* Port 0x00 with various high bytes: CMOS data read via IN r,(C) */
+    if (lo == 0x00) return 0x00;
 
     /* Keyboard: port #FE (ZX matrix) */
     if (lo == 0xFE) {
@@ -245,8 +252,13 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
     /* SIO ports */
     if (lo == 0x18 || lo == 0x19) return;
 
-    /* CMOS */
+    /* CMOS: port 0x1C write = address (via OUT (n),A: hi byte = A, lo = 0x1C) */
+    if (lo == 0x1C) return;  /* Address write, absorbed */
+    /* CMOS: port 0x1D = address write, 0x1E = data write */
     if (lo == 0x1D || lo == 0x1E) return;
+
+    /* Port 0xEE/0xEF: FPGA config — absorb */
+    if (lo == 0xEE || lo == 0xEF) return;
 
     /* AY ports */
     if (lo == 0x8D || lo == 0x8E) return;
