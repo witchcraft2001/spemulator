@@ -18,23 +18,15 @@ int main(int argc, char **argv) {
     printf("SPEmulator — Sprinter SP2000 Emulator\n");
     printf("Platform: %s\n\n", platform_name());
 
-    /* Parse configuration */
     sp_config_t *config = config_create();
-    if (!config) {
-        fprintf(stderr, "Failed to create config\n");
-        return 1;
-    }
+    if (!config) { fprintf(stderr, "Failed to create config\n"); return 1; }
 
-    /* Try loading default config file */
     config_load_file(config, platform_default_config_path());
-
-    /* Command line overrides config file */
     if (config_parse_args(config, argc, argv) < 0) {
         config_destroy(config);
         return 1;
     }
 
-    /* Create machine */
     sp_machine_t *machine = machine_create(config);
     if (!machine) {
         fprintf(stderr, "Failed to create machine\n");
@@ -42,57 +34,50 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Initialize debugger */
     sp_debugger_t debugger;
     debugger_init(&debugger);
     if (config->start_debugger) {
         debugger.active = true;
         debugger_break(&debugger);
-        printf("Debugger active. Press F12 to toggle.\n");
     }
 
-    /* Initialize SDL3 */
     sp_sdl_t sdl;
     memset(&sdl, 0, sizeof(sdl));
-
     if (sdl_init(&sdl, machine->fb_width, machine->fb_height,
                  config->scale, config->fullscreen) < 0) {
-        fprintf(stderr, "Failed to initialize SDL\n");
         machine_destroy(machine);
         config_destroy(config);
         return 1;
     }
 
-    /* Initialize audio */
     sp_audio_t audio;
+    memset(&audio, 0, sizeof(audio));
     if (config->audio_enabled) {
-        if (audio_init(&audio, config->sample_rate) == 0) {
+        if (audio_init(&audio, config->sample_rate) == 0)
             sdl_audio_init(&sdl, config->sample_rate);
-        }
     }
 
     printf("Machine initialized. CPU=%dMHz, RAM=%dKB\n",
            config->cpu_speed_mhz, config->ram_size_kb);
-    if (config->rom_path[0])
-        printf("ROM: %s\n", config->rom_path);
+    if (config->rom_path[0]) printf("ROM: %s\n", config->rom_path);
     printf("Video: %dx%d @ %dx scale\n",
            machine->fb_width, machine->fb_height, config->scale);
     printf("\nControls: F11=Fullscreen, F12=Debugger, Ctrl+F10=Quit\n\n");
 
     /* Main loop */
-    u64 frame_time_ms = 1000 / SP_FRAME_RATE_PAL;
     u64 last_frame = sdl_get_ticks();
+    int render_skip = 0;
 
     while (machine->running) {
-        u64 now = sdl_get_ticks();
-
-        /* Process SDL events */
-        if (!sdl_poll_events(&sdl, machine)) {
-            machine->running = false;
-            break;
+        /* Process SDL events (less frequent during boot) */
+        if (render_skip == 0 || machine->cpu.iff1) {
+            if (!sdl_poll_events(&sdl, machine)) {
+                machine->running = false;
+                break;
+            }
         }
 
-        /* Debugger check */
+        /* Debugger */
         if (machine->debugger_active != debugger.active) {
             debugger.active = machine->debugger_active;
             if (debugger.active) {
@@ -108,44 +93,44 @@ int main(int argc, char **argv) {
         if (!debugger.active || debugger.state == DBG_STATE_RUNNING) {
             machine_run_frame(machine);
 
-            /* Boot status at key frames */
-            if (machine->frame_count == 50 || machine->frame_count == 500 ||
-                machine->frame_count == 5000 || machine->frame_count == 30000) {
-                printf("F%3d: PC=%04X SP=%04X IFF=%d IM=%d Pg=%02X/%02X/%02X/%02X\n",
+            /* Boot trace */
+            if (machine->frame_count == 1000 ||
+                machine->frame_count == 10000 ||
+                machine->frame_count == 50000 ||
+                machine->frame_count == 200000) {
+                printf("F%5d: PC=%04X SP=%04X IFF=%d Pg=%02X/%02X/%02X/%02X ts=%lluM\n",
                        machine->frame_count,
                        machine->cpu.pc.w, machine->cpu.sp.w,
-                       machine->cpu.iff1, machine->cpu.im,
+                       machine->cpu.iff1,
                        machine->win_page[0], machine->win_page[1],
-                       machine->win_page[2], machine->win_page[3]);
-                int vram_nz = 0;
-                for (int i = 0; i < SP_VRAM_LINES * SP_VRAM_LINE; i++)
-                    if (machine->vram[i]) vram_nz++;
-                printf("  VRAM: %d non-zero bytes\n", vram_nz);
+                       machine->win_page[2], machine->win_page[3],
+                       (unsigned long long)(machine->cpu.total_tstates / 1000000));
                 fflush(stdout);
             }
         }
 
-        /* Render video */
-        video_render_frame(machine);
-        sdl_present(&sdl, machine->framebuffer, machine->fb_width, machine->fb_height);
-
-        /* Generate and queue audio */
-        if (config->audio_enabled) {
-            audio_generate_frame(&audio, machine);
-            sdl_audio_queue(&sdl, audio.buffer, audio.buffer_size);
+        /* Render video — minimal during boot */
+        render_skip++;
+        if (render_skip >= 500 || machine->frame_count > 100000) {
+            render_skip = 0;
+            if (machine->frame_count > 100000) {
+                video_render_frame(machine);
+            }
+            sdl_present(&sdl, machine->framebuffer, machine->fb_width, machine->fb_height);
         }
 
-        /* Frame timing */
-        u64 elapsed = sdl_get_ticks() - last_frame;
-        if (elapsed < frame_time_ms) {
-            sdl_delay((u32)(frame_time_ms - elapsed));
+        /* Frame timing: only after boot complete (IFF=1) */
+        if (machine->cpu.iff1) {
+            u64 now = sdl_get_ticks();
+            u64 elapsed = now - last_frame;
+            u64 frame_time_ms = 1000 / SP_FRAME_RATE_PAL;
+            if (elapsed < frame_time_ms)
+                sdl_delay((u32)(frame_time_ms - elapsed));
+            last_frame = sdl_get_ticks();
         }
-        last_frame = sdl_get_ticks();
     }
 
-    /* Cleanup */
-    if (config->audio_enabled)
-        audio_destroy(&audio);
+    if (config->audio_enabled) audio_destroy(&audio);
     sdl_destroy(&sdl);
     machine_destroy(machine);
     config_destroy(config);

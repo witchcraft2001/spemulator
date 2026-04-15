@@ -115,6 +115,10 @@ typedef struct sp_machine {
     u64            tstates_in_frame;
     u32            frame_count;
 
+    /* CMOS/RTC */
+    u8             cmos_addr;     /* Current CMOS address register */
+    u8             cmos_data[256]; /* CMOS RAM */
+
     /* Keyboard (ZX matrix: 8 half-rows) */
     u8             key_matrix[8];
 

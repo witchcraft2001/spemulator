@@ -263,17 +263,9 @@ u8 machine_port_read(void *ctx, u16 port) {
     if (lo == 0x1A) return sio_read_data(&m->sio, 1);
     if (lo == 0x1B) return sio_read_ctrl(&m->sio, 1);
 
-    /* CMOS/RTC (port 0x1C: data read, address from high byte) */
+    /* CMOS/RTC: port 0x1C = data read at current CMOS address */
     if (lo == 0x1C) {
-        u8 cmos_addr = (port >> 8) & 0xFF;
-        switch (cmos_addr) {
-        case 0x0E: return 0x80; /* Fast boot (skip RAM test) */
-        case 0x0F: return 0x10; /* Keyboard delay */
-        case 0x10: return 0x00; /* Boot: FDD1 */
-        case 0x11: return 0x01; /* FDD/IDE config */
-        case 0x1B: return 0x00; /* Normal speed */
-        default:   return 0x00;
-        }
+        return m->cmos_data[m->cmos_addr];
     }
 
     /* Port #FE: keyboard matrix */
@@ -328,8 +320,12 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
     sp_machine_t *m = (sp_machine_t *)ctx;
     u8 lo = port & 0xFF;
 
-    /* During starting, I/O writes are ignored (MAME: dcp_w line 702) */
-    if (m->starting) return;
+    /* During starting, I/O writes clear starting flag but are processed.
+     * In real DCP, starting clears on first non-memory bus cycle. */
+    if (m->starting) {
+        m->starting = false;
+        update_memory(m);
+    }
 
     /* === Special-cased ports (before DCP): 0x3C/0x7C === */
     if ((lo & 0xBF) == 0x3C) {
@@ -359,8 +355,19 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
     if (lo == 0x19) { sio_write_ctrl(&m->sio, 0, data); return; }
     if (lo == 0x1A) { sio_write_data(&m->sio, 1, data); return; }
     if (lo == 0x1B) { sio_write_ctrl(&m->sio, 1, data); return; }
-    /* CMOS */
-    if (lo == 0x1C || lo == 0x1D || lo == 0x1E) return;
+    /* CMOS: 0x1C = data write AND address (via OUT(n),A where A=addr or data)
+     * In Sprinter, port 0x1C handles BOTH address and data.
+     * The DCP.MIF says: 0x1C=CMOS_DAT_RD, 0x1D=CMOS_ADR_WR, 0x1E=CMOS_DAT_WR
+     * But BIOS uses OUT(#1C),A for BOTH setting address and writing data.
+     * Convention: writes to 0x1C set the CMOS address (for next read),
+     * writes to 0x1E write data to current address. */
+    if (lo == 0x1C) {
+        /* Address write — next read from 0x1C will return cmos_data[data] */
+        m->cmos_addr = data;
+        return;
+    }
+    if (lo == 0x1D) { m->cmos_addr = data; return; }
+    if (lo == 0x1E) { m->cmos_data[m->cmos_addr] = data; return; }
     /* Port #FE */
     if (lo == 0xFE) { m->port_fe = data; return; }
 
@@ -373,7 +380,7 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
     if (lo == 0xC2 && (port >> 8) != 0x00) { /* 0xC2 with non-zero A = page write, not border */
         m->ram_pages[0x2A] = data; update_memory(m); return;
     }
-    if (lo == 0xE2) { m->ram_pages[0x2B] = data; update_memory(m); return; } /* WIN3 direct */
+    if (lo == 0xE2) { m->ram_pages[0x2B] = data; update_memory(m); return; }
 
     /* === DCP-decoded system ports 0xC0-0xFF → ram_pages writes === */
     if (lo >= 0xC0) {
@@ -603,6 +610,15 @@ void machine_reset(sp_machine_t *m) {
     /* Initialize RAM page table */
     memcpy(m->ram_pages, default_ram_pages, sizeof(default_ram_pages));
 
+    /* CMOS defaults */
+    m->cmos_addr = 0;
+    memset(m->cmos_data, 0, sizeof(m->cmos_data));
+    m->cmos_data[0x0E] = 0x80; /* Fast boot (skip RAM test) */
+    m->cmos_data[0x0F] = 0x10; /* Keyboard delay */
+    m->cmos_data[0x10] = 0x00; /* Boot device: FDD1 */
+    m->cmos_data[0x11] = 0x01; /* FDD/IDE config */
+    m->cmos_data[0x1B] = 0x00; /* Hardware: normal speed */
+
     /* Video */
     m->port_y = 0;
     m->rgmod = 0;
@@ -642,14 +658,10 @@ int machine_run_frame(sp_machine_t *m) {
         int t = z80_step(&m->cpu);
         executed += t;
         m->cpu.total_tstates += t;
-
-        /* Clock CTC */
-        m->tstates_in_frame += t;
-        if (m->tstates_in_frame >= 100) {
-            ctc_clock(&m->ctc, (int)m->tstates_in_frame);
-            m->tstates_in_frame = 0;
-        }
     }
+
+    /* Clock CTC once per frame */
+    ctc_clock(&m->ctc, frame_ts);
 
     /* VSync IRQ (IM1: vector 0xFF) */
     if (m->cpu.iff1 && !m->cpu.irq_pending) {
