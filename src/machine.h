@@ -78,11 +78,22 @@ typedef struct sp_machine {
 
     /* Memory (owned by machine, managed by MMU) */
     u8            *ram;         /* 4MB RAM */
-    u8            *rom;         /* 512KB ROM */
+    u8            *rom;         /* 256KB ROM (16 × 16KB pages) */
     u8            *vram;        /* 256KB VRAM (SP_VRAM_LINES * SP_VRAM_LINE) */
+    u8            *fastram;     /* 64KB FastRAM (cache) */
 
-    /* Memory page registers */
+    /* Boot state: two-phase boot like real Sprinter */
+    bool           conf_loading;  /* Phase 1: config loader running from ROM page 0x0C */
+    u32            conf_bytes;    /* Counter: bytes written to FPGA config port */
+    u8             rom_rg;        /* ROM register: selects which ROM page at WIN0 */
+    bool           rom_sys;       /* ROM system mode */
+    bool           cash_on;       /* FastRAM/cache enabled */
+    bool           dos_mode;      /* DOS active (0=on, 1=off), init=1 */
+
+    /* Memory page registers — port-based (Sprinter native) */
     u8             page_reg[4]; /* Current page in each window (#82,#A2,#C2,#E2) */
+    /* RAM page table (64 entries, indexed by port hi-nibble) */
+    u8             ram_pages[64];
 
     /* Pentagon/Scorpion compat registers */
     u8             pn;          /* Pentagon page register (#7FFD) */

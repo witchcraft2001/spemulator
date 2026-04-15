@@ -107,6 +107,15 @@ int main(int argc, char **argv) {
         /* Run CPU for one frame */
         if (!debugger.active || debugger.state == DBG_STATE_RUNNING) {
             machine_run_frame(machine);
+
+            /* Trace first 3 frames only */
+            if (machine->frame_count <= 3) {
+                printf("Frame %d: PC=%04X SP=%04X AF=%04X BC=%04X HL=%04X\n",
+                       machine->frame_count,
+                       machine->cpu.pc.w, machine->cpu.sp.w,
+                       machine->cpu.af.w, machine->cpu.bc.w,
+                       machine->cpu.hl.w);
+            }
         }
 
         /* Render video */
