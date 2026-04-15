@@ -9,6 +9,7 @@
  */
 #include "machine.h"
 #include "memory/mmu.h"
+#include "memory/dcp.h"
 #include "video/video.h"
 #include "video/palette.h"
 #include "video/accel.h"
@@ -604,6 +605,9 @@ sp_machine_t *machine_create(sp_config_t *config) {
         machine_destroy(m);
         return NULL;
     }
+
+    /* Initialize DCP port decode table */
+    dcp_init(&m->dcp);
 
     /* Initialize bus, CPU, peripherals */
     bus_init(&m->bus, m);

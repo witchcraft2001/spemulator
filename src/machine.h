@@ -11,6 +11,7 @@
 #define SPEMU_MACHINE_H
 
 #include "types.h"
+#include "memory/dcp.h"
 #include "bus.h"
 #include "cpu/z80.h"
 #include "cpu/ctc.h"
@@ -52,6 +53,7 @@ typedef struct sp_machine {
     z80_t          cpu;
     sp_ctc_t       ctc;
     sp_sio_t       sio;
+    sp_dcp_t       dcp;
     sp_bus_t       bus;
     sp_config_t   *config;
 

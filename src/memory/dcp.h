@@ -1,29 +1,37 @@
 /*
  * SPEmulator — DCP (Dynamic Configuration Port) Decoder
- * 256x16-bit LUT mapping port addresses to device types and wait states.
+ *
+ * The DCP is a 16K-entry lookup table in the FPGA that maps:
+ *   {CNF[4:3], PN[5], DOS, R/W, A[15:14], A[13], A[7], A[6:5,2:0]} → dcpp
+ *
+ * The dcpp (decoded port) value determines which device handler processes
+ * the I/O operation. Values 0xC0-0xEF map to ram_pages[] (system ports).
+ *
+ * Based on MAME's sprinter_state::dcp_r/dcp_w implementation.
  */
 #ifndef SPEMU_DCP_H
 #define SPEMU_DCP_H
 
 #include "types.h"
 
+/* DCP table size: 14-bit address = 16384 entries */
+#define DCP_TABLE_SIZE  16384
+
 typedef struct sp_machine sp_machine_t;
 
-/* DCP entry: 16-bit value from lookup table */
 typedef struct {
-    u8  type;       /* bits 15-12: device type */
-    u8  wait;       /* bits 14-12: wait state selector */
-    u16 signals;    /* bits 11-0: MAX7000 control signals */
-} sp_dcp_entry_t;
-
-typedef struct {
-    sp_dcp_entry_t table[256];  /* Indexed by low byte of port address */
+    u8 table[DCP_TABLE_SIZE];  /* dcpp value for each 14-bit DCP offset */
 } sp_dcp_t;
 
+/* Initialize DCP table from built-in MIF data */
 void dcp_init(sp_dcp_t *dcp);
 void dcp_reset(sp_dcp_t *dcp);
 
-/* Lookup DCP entry for given port */
-sp_dcp_entry_t dcp_lookup(sp_dcp_t *dcp, u8 port_lo);
+/* Compute DCP offset from port address and machine state.
+ * is_read: 1 for port read, 0 for port write */
+u16 dcp_compute_offset(sp_machine_t *m, u16 port, int is_read);
+
+/* Look up dcpp for a given port address */
+u8 dcp_lookup_port(sp_dcp_t *dcp, sp_machine_t *m, u16 port, int is_read);
 
 #endif
