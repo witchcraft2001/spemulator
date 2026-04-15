@@ -36,35 +36,6 @@ static inline u16 pop16(z80_t *cpu) {
 
 /* --- ALU operations --- */
 
-static inline void alu_add_a(z80_t *cpu, u8 val) {
-    u16 result = (u16)Z80_A + val;
-    u8 lookup = ((Z80_A & 0x88) >> 3) | ((val & 0x88) >> 2) | ((result & 0x88) >> 1);
-    Z80_A = (u8)result;
-    Z80_F = ((result & 0x100) ? Z80_FLAG_C : 0)
-          | z80_sz53_table[Z80_A]
-          | ((lookup & 0x07) ? Z80_FLAG_H : 0)  /* half-carry from lookup */
-          | (((lookup >> 4) ^ (lookup >> 5)) & Z80_FLAG_PV); /* overflow */
-    /* More precise half-carry */
-    Z80_F &= ~Z80_FLAG_H;
-    if (((Z80_A ^ val ^ (u8)result) & 0x10)) Z80_F |= Z80_FLAG_H;
-    /* More precise overflow */
-    Z80_F &= ~Z80_FLAG_PV;
-    if (((val ^ Z80_A ^ 0x80) & (val ^ (u8)result) & 0x80)) /* removed, use below */ {}
-    /* Recompute cleanly */
-    u8 r8 = (u8)result;
-    Z80_F = ((result & 0x100) ? Z80_FLAG_C : 0)
-          | z80_sz53_table[r8]
-          | (((Z80_A ^ val ^ r8) & 0x10) ? Z80_FLAG_H : 0);
-    /* Overflow: operands same sign, result different sign (but this is ADD so both positive-sense) */
-    /* For ADD: overflow if (A_old ^ val) bit7 == 0 AND (A_old ^ result) bit7 == 1 */
-    /* We need A before the add, but we already overwrote it. Let's restructure. */
-    /* Actually, let me redo this properly: */
-    (void)r8;
-    /* This function is broken, let me rewrite below */
-}
-
-/* Let me rewrite ALU operations cleanly */
-
 static inline void z80_add_a(z80_t *cpu, u8 val) {
     u8 a = Z80_A;
     u16 result = (u16)a + val;

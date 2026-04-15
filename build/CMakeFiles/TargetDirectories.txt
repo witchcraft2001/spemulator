@@ -1,0 +1,7 @@
+/Users/dmitry/dev/zx/sprinter/emuls/spemulator/build/CMakeFiles/spemulator.dir
+/Users/dmitry/dev/zx/sprinter/emuls/spemulator/build/CMakeFiles/edit_cache.dir
+/Users/dmitry/dev/zx/sprinter/emuls/spemulator/build/CMakeFiles/rebuild_cache.dir
+/Users/dmitry/dev/zx/sprinter/emuls/spemulator/build/CMakeFiles/list_install_components.dir
+/Users/dmitry/dev/zx/sprinter/emuls/spemulator/build/CMakeFiles/install.dir
+/Users/dmitry/dev/zx/sprinter/emuls/spemulator/build/CMakeFiles/install/local.dir
+/Users/dmitry/dev/zx/sprinter/emuls/spemulator/build/CMakeFiles/install/strip.dir
