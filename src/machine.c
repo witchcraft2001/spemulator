@@ -96,11 +96,17 @@ void machine_mem_write(void *ctx, u16 addr, u8 data) {
         return;
 
     /* During conf loading, intercept WIN3 writes at 0xFE00-0xFEFF:
-     * this is the FPGA configuration memory-mapped port.
-     * Don't write bitstream data to RAM — count bytes instead. */
-    if (m->conf_loading && win == 3 && (addr & 0xFF00) == 0xFE00) {
-        m->conf_bytes++;
-        return;
+     * FPGA config memory-mapped port. Bitstream bytes written here via
+     * repeated LD (DE),A; RRCA pattern should not go to RAM.
+     * But other WIN3 writes (loader copying tables) should pass through. */
+    if (m->conf_loading && win == 3) {
+        u16 win3_offset = addr & 0x3FFF;
+        if (win3_offset >= 0x3E00 && win3_offset <= 0x3EFF) {
+            /* FPGA config port area — count but don't store */
+            m->conf_bytes++;
+            return;
+        }
+        /* Other WIN3 writes pass through normally */
     }
 
     u8 page = m->page_reg[win];
@@ -211,9 +217,16 @@ u8 machine_port_read(void *ctx, u16 port) {
         return result;
     }
 
-    /* IDE status — report not present */
-    if ((port & 0xFF) == 0x53 && ((port >> 8) & 0xFF) == 0x40)
-        return 0x00; /* BSY=0, RDY=0 → no device */
+    /* IDE ports: return "no device" for all IDE register reads.
+     * Read ports: 0x0050-0x0057, status: 0x4053.
+     * No device: status=0x00 (BSY=0, RDY=0), error=0x00 */
+    if (lo >= 0x50 && lo <= 0x57) return 0x00;
+
+    /* Beta disk / FDD ports (WD1793): 0x1F, 0x3F, 0x5F, 0x7F, 0xFF
+     * Status register: bit 7 = not ready, others = 0 */
+    if (lo == 0x1F) return 0x80; /* WD1793 status: not ready */
+    if (lo == 0x3F || lo == 0x5F || lo == 0x7F) return 0x00;
+    if (lo == 0xFF) return 0x00; /* System register */
 
     return bus_port_read(&m->bus, port);
 }
@@ -223,7 +236,22 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
     u8 lo = port & 0xFF;
 
     /* Page registers */
-    if (lo == SP_PORT_PAGE0) { m->page_reg[0] = data; return; }
+    if (lo == SP_PORT_PAGE0) {
+        m->page_reg[0] = data;
+        /* When BIOS switches WIN0 to RAM page (< 0x80), inject resident code.
+         * This simulates what the FPGA config loader would have prepared. */
+        if (data < 0x80 && m->rom) {
+            u32 rom8 = 8 * ROM_PAGE_SIZE;
+            u32 ram_base = (u32)data * ROM_PAGE_SIZE;
+            /* Copy RST vectors (0x0000-0x0070) */
+            memcpy(&m->ram[ram_base], &m->rom[rom8], 0x0070);
+            /* Copy dispatch/jump table (0x0400-0x0FFF) */
+            memcpy(&m->ram[ram_base + 0x0400], &m->rom[rom8 + 0x0400], 0x0C00);
+            /* Copy resident code (0x3F00-0x3FFF) */
+            memcpy(&m->ram[ram_base + 0x3F00], &m->rom[rom8 + 0x3F00], 0x0100);
+        }
+        return;
+    }
     if (lo == SP_PORT_PAGE1) { m->page_reg[1] = data; return; }
     if (lo == SP_PORT_PAGE2) { m->page_reg[2] = data; return; }
     if (lo == SP_PORT_PAGE3) { m->page_reg[3] = data; return; }
@@ -319,6 +347,12 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
 
     /* Port 0xEE/0xEF: FPGA config — absorb */
     if (lo == 0xEE || lo == 0xEF) return;
+
+    /* IDE write ports: absorb (0x50-0x57 with various hi bytes) */
+    if (lo >= 0x50 && lo <= 0x57) return;
+
+    /* Beta disk / FDD write ports */
+    if (lo == 0x1F || lo == 0x3F || lo == 0x5F || lo == 0x7F || lo == 0xFF) return;
 
     /* AY ports */
     if (lo == 0x8D || lo == 0x8E) return;
@@ -488,27 +522,17 @@ void machine_reset(sp_machine_t *m) {
 
     /*
      * Phase 1: Run config loader (ROM page 0x0C) to initialize RAM.
-     * The loader writes FPGA bitstream to 0xFE00 (memory-mapped) and
-     * copies critical tables into RAM page 0. We intercept 0xFE00 writes
-     * (don't pollute RAM) and let it run until completion.
-     *
-     * When loader reaches JP 0x0000 (via RST 38 at offset 0x38), or
-     * after a timeout, we switch to Phase 2 with ROM page 8.
+     * Skip FPGA config loader. Pre-copy BIOS resident code from ROM page 8
+     * into RAM page 0 (see below). Start BIOS execution from ROM page 8.
      */
-    m->conf_loading = true;
+    m->conf_loading = false;
     m->conf_bytes = 0;
     m->rom_rg = 0x08;
     m->rom_sys = false;
     m->cash_on = false;
     m->dos_mode = true;
-    m->cash_on = false;
-    m->dos_mode = true;
 
-    /* Config loader page mapping:
-     * WIN0 = ROM page 0x0C (config loader, overridden by conf_loading flag)
-     * WIN3 = RAM page 0 (loader writes DCP/tables here via 0xFE00)
-     */
-    m->page_reg[0] = 0x8C;  /* ROM page 12 (overridden by conf_loading) */
+    m->page_reg[0] = 0x88;  /* ROM page 8 (BIOS entry) */
     m->page_reg[1] = 0x05;  /* RAM page 5 */
     m->page_reg[2] = 0x02;  /* RAM page 2 */
     m->page_reg[3] = 0x00;  /* RAM page 0 */
@@ -529,6 +553,23 @@ void machine_reset(sp_machine_t *m) {
     m->accel_size = 0;
     m->frame_count = 0;
     m->tstates_in_frame = 0;
+
+    /*
+     * Pre-initialize RAM page 0 with BIOS resident code from ROM page 8.
+     * In real Sprinter this is done by the FPGA config loader.
+     * We copy: RST vectors (0x0000-0x0070), dispatch table (0x0800-0x0FFF),
+     * and resident code (0x3F00-0x3FFF).
+     */
+    if (m->rom) {
+        u32 rom8 = 8 * ROM_PAGE_SIZE;
+        /* Copy RST vectors and early code (0x0000-0x00FF) */
+        memcpy(&m->ram[0x0000], &m->rom[rom8 + 0x0000], 0x0100);
+        /* Copy dispatch table area (0x0400-0x0FFF) */
+        memcpy(&m->ram[0x0400], &m->rom[rom8 + 0x0400], 0x0C00);
+        /* Copy resident code area (0x3F00-0x3FFF) */
+        memcpy(&m->ram[0x3F00], &m->rom[rom8 + 0x3F00], 0x0100);
+        printf("Boot: Copied BIOS resident data from ROM page 8 → RAM page 0\n");
+    }
 
     /* Reset peripherals */
     ctc_reset(&m->ctc);
