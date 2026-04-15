@@ -108,13 +108,14 @@ int main(int argc, char **argv) {
         if (!debugger.active || debugger.state == DBG_STATE_RUNNING) {
             machine_run_frame(machine);
 
-            /* Trace first 3 frames only */
-            if (machine->frame_count <= 3) {
-                printf("Frame %d: PC=%04X SP=%04X AF=%04X BC=%04X HL=%04X\n",
+            /* Boot trace */
+            if (machine->frame_count <= 3 || machine->frame_count == 20) {
+                printf("F%3d: PC=%04X SP=%04X IFF=%d Pg=%02X/%02X/%02X/%02X\n",
                        machine->frame_count,
                        machine->cpu.pc.w, machine->cpu.sp.w,
-                       machine->cpu.af.w, machine->cpu.bc.w,
-                       machine->cpu.hl.w);
+                       machine->cpu.iff1,
+                       machine->page_reg[0], machine->page_reg[1],
+                       machine->page_reg[2], machine->page_reg[3]);
             }
         }
 

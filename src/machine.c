@@ -13,9 +13,19 @@
 #include "video/palette.h"
 #include "video/accel.h"
 #include "input/keyboard.h"
+#include "cpu/ctc.h"
+#include "cpu/sio.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+/* CTC IRQ callback — fires when a CTC channel reaches zero */
+static void ctc_irq_handler(void *ctx, int channel) {
+    sp_machine_t *m = (sp_machine_t *)ctx;
+    /* CTC vector = base_vector + channel*2 */
+    u8 vector = m->ctc.vector + (u8)(channel * 2);
+    z80_irq(&m->cpu, vector);
+}
 
 /* ROM layout: 256KB = 16 pages × 16KB */
 #define ROM_TOTAL_SIZE   0x40000
@@ -137,22 +147,35 @@ u8 machine_port_read(void *ctx, u16 port) {
     if (lo == 0xC4 || lo == 0xCC) return m->port_y;
     if (lo == 0xC5 || lo == 0xCD) return m->rgmod;
 
-    /* CTC ports (0x10-0x13) — return 0 for now */
-    if (lo >= 0x10 && lo <= 0x13) return 0;
+    /* CTC ports (0x10-0x13) */
+    if (lo >= 0x10 && lo <= 0x13)
+        return ctc_read(&m->ctc, lo - 0x10);
 
-    /* SIO ports: 0x18 = data, 0x19 = status */
-    if (lo == 0x18) return 0;   /* No keyboard data */
-    if (lo == 0x19) return 0;   /* SIO status: no data ready */
+    /* SIO ports: 0x18 = CH-A data (keyboard), 0x19 = CH-A ctrl,
+     *            0x1A = CH-B data (serial), 0x1B = CH-B ctrl */
+    if (lo == 0x18) return sio_read_data(&m->sio, 0);
+    if (lo == 0x19) return sio_read_ctrl(&m->sio, 0);
+    if (lo == 0x1A) return sio_read_data(&m->sio, 1);
+    if (lo == 0x1B) return sio_read_ctrl(&m->sio, 1);
 
-    /* CMOS/RTC: port 0x1C reads data at selected CMOS address */
+    /* CMOS/RTC: port 0x1C reads data at selected CMOS address.
+     * The high byte of the port address is the CMOS register index
+     * (set by previous OUT to port 0x1C where A=register). */
     if (lo == 0x1C) {
-        /* Return CMOS data at current address register */
-        /* For now return sensible defaults */
-        return 0x00;
+        u8 cmos_addr = (port >> 8) & 0xFF;
+        /* Return sensible defaults for key CMOS registers */
+        switch (cmos_addr) {
+        case 0x0E: return 0x80;  /* Fast boot (skip RAM test), no buzzer */
+        case 0x0F: return 0x10;  /* Keyboard delay/repeat default */
+        case 0x10: return 0x02;  /* Boot device: IDE1 */
+        case 0x11: return 0x01;  /* FDD/IDE config */
+        case 0x1B: return 0x00;  /* Hardware config: normal speed */
+        default: return 0x00;
+        }
     }
 
-    /* Port 0x00 with various high bytes: CMOS data read via IN r,(C) */
-    if (lo == 0x00) return 0x00;
+    /* Port 0x00 with various high bytes: general port read */
+    if (lo == 0x00) return 0xFF;
 
     /* Keyboard: port #FE (ZX matrix) */
     if (lo == 0xFE) {
@@ -246,11 +269,17 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
         return;
     }
 
-    /* CTC ports (0x10-0x13) — absorb */
-    if (lo >= 0x10 && lo <= 0x13) return;
+    /* CTC ports (0x10-0x13) */
+    if (lo >= 0x10 && lo <= 0x13) {
+        ctc_write(&m->ctc, lo - 0x10, data);
+        return;
+    }
 
     /* SIO ports */
-    if (lo == 0x18 || lo == 0x19) return;
+    if (lo == 0x18) { sio_write_data(&m->sio, 0, data); return; }
+    if (lo == 0x19) { sio_write_ctrl(&m->sio, 0, data); return; }
+    if (lo == 0x1A) { sio_write_data(&m->sio, 1, data); return; }
+    if (lo == 0x1B) { sio_write_ctrl(&m->sio, 1, data); return; }
 
     /* CMOS: port 0x1C write = address (via OUT (n),A: hi byte = A, lo = 0x1C) */
     if (lo == 0x1C) return;  /* Address write, absorbed */
@@ -389,6 +418,12 @@ sp_machine_t *machine_create(sp_config_t *config) {
 
     memset(m->key_matrix, 0xFF, sizeof(m->key_matrix));
 
+    /* Initialize CTC and SIO */
+    ctc_init(&m->ctc);
+    m->ctc.irq_callback = ctc_irq_handler;
+    m->ctc.irq_ctx = m;
+    sio_init(&m->sio);
+
     /* Load ROM */
     load_rom(m, config->rom_path);
 
@@ -421,29 +456,26 @@ void machine_reset(sp_machine_t *m) {
     z80_reset(&m->cpu);
 
     /*
-     * Skip Phase 1 (FPGA configuration) — we emulate hardware directly.
-     * Start directly in Phase 2: BIOS execution from ROM page 0.
+     * Skip Phase 1 (FPGA bitstream upload). The config loader only writes
+     * bitstream data to memory-mapped FPGA port (0xFE00) — it doesn't
+     * set up RAM. Real data initialization happens in BIOS (ROM page 8).
      *
-     * In real Sprinter, the config loader (ROM page 0x0C) loads the FPGA
-     * bitstream and sets up the DCP table. We pre-initialize the DCP table
-     * and start with ROM page 0 mapped to address 0x0000.
+     * Start directly with ROM page 8 which is the real BIOS entry point.
      */
     m->conf_loading = false;
     m->conf_bytes = 0;
     m->rom_rg = 0;
     m->rom_sys = false;
     m->cash_on = false;
-    m->dos_mode = true; /* DOS off initially */
+    m->dos_mode = true;
 
-    /* Standard post-configuration page mapping:
-     * WIN0 = ROM page 8 (BIOS entry — real entry after FPGA config)
-     *   ROM page 8 starts with JP 0x00B0 → DI; IM 1; initialization code
-     *   ROM page 0 is just DI;HALT (pre-FPGA stub)
+    /* Post-configuration page mapping:
+     * WIN0 = ROM page 8 (BIOS entry: JP 0x00B0 → DI; IM 1; init)
      * WIN1 = RAM page 5
      * WIN2 = RAM page 2
      * WIN3 = RAM page 0
      */
-    m->page_reg[0] = 0x88;  /* ROM page 8 (BIOS real entry) */
+    m->page_reg[0] = 0x88;  /* ROM page 8 */
     m->page_reg[1] = 0x05;  /* RAM page 5 */
     m->page_reg[2] = 0x02;  /* RAM page 2 */
     m->page_reg[3] = 0x00;  /* RAM page 0 */
@@ -465,7 +497,37 @@ void machine_reset(sp_machine_t *m) {
     m->frame_count = 0;
     m->tstates_in_frame = 0;
 
-    printf("Boot: Starting BIOS from ROM page 0 (skipping FPGA config)\n");
+    /*
+     * Pre-load BIOS resident code into RAM page 0.
+     * The config loader would normally do this, but we skip it.
+     * Copy from ROM page 8 (0x3FD0-0x3FFF) to RAM page 0 (0x3FD0-0x3FFF).
+     * This contains RST vector handlers that switch ROM in/out.
+     * Also copy RST 08 and RST 38 handlers.
+     */
+    if (m->rom) {
+        u32 rom8_base = 8 * ROM_PAGE_SIZE;  /* ROM page 8 offset */
+        /* Copy resident code block: ROM page 8 at 0x3FD0-0x3FFF → RAM page 0 */
+        for (int i = 0x3F00; i < 0x4000; i++) {
+            u8 b = m->rom[rom8_base + i];
+            if (b != 0xFF) /* Skip erased flash bytes */
+                m->ram[i] = b;
+        }
+        /* Also set up RST 08 vector in RAM page 0: JP to BIOS RST8 handler */
+        /* RST 08 at 0x0008: F5 3E 00 D3 7C F1 C9 (push af, LD A,0, OUT 7C, pop af, ret) */
+        /* Actually just copy the first 0x100 bytes from ROM page 8 for all RST vectors */
+        for (int i = 0; i < 0x100; i++) {
+            u8 b = m->rom[rom8_base + i];
+            if (b != 0xFF)
+                m->ram[i] = b;
+        }
+        printf("Boot: Pre-loaded BIOS resident code into RAM page 0\n");
+    }
+
+    /* Reset peripherals */
+    ctc_reset(&m->ctc);
+    sio_reset(&m->sio);
+
+    printf("Boot: Starting BIOS from ROM page 8\n");
 
     bus_reset_all(&m->bus);
 }
@@ -482,9 +544,19 @@ int machine_run_frame(sp_machine_t *m) {
         int t = z80_step(&m->cpu);
         executed += t;
         m->cpu.total_tstates += t;
+
+        /* Clock CTC periodically (every ~100 T-states for efficiency) */
+        m->tstates_in_frame += t;
+        if (m->tstates_in_frame >= 100) {
+            ctc_clock(&m->ctc, (int)m->tstates_in_frame);
+            m->tstates_in_frame = 0;
+        }
     }
 
-    /* VSync interrupt (IM1: RST 38h, IM2: vectored) */
+    /* VSync: generate interrupt at end of frame.
+     * In IM1, RST 38 vector = 0xFF (hardware default).
+     * In IM2, CTC provides the vector via irq_callback.
+     * Also signal CTC channel 3 (VSync source). */
     if (m->cpu.iff1) {
         z80_irq(&m->cpu, 0xFF);
     }

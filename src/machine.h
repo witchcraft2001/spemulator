@@ -8,6 +8,8 @@
 #include "types.h"
 #include "bus.h"
 #include "cpu/z80.h"
+#include "cpu/ctc.h"
+#include "cpu/sio.h"
 #include "config.h"
 
 /* Forward declarations */
@@ -73,6 +75,8 @@ typedef struct sp_keyboard sp_keyboard_t;
 typedef struct sp_machine {
     /* Components */
     z80_t          cpu;
+    sp_ctc_t       ctc;        /* Z80-CTC: 4 channels */
+    sp_sio_t       sio;        /* Z80-SIO: 2 channels (KBD + serial) */
     sp_bus_t       bus;
     sp_config_t   *config;
 
