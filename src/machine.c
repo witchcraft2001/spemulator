@@ -582,11 +582,9 @@ int machine_run_frame(sp_machine_t *m) {
         }
     }
 
-    /* VSync: generate interrupt at end of frame.
-     * In IM1, RST 38 vector = 0xFF (hardware default).
-     * In IM2, CTC provides the vector via irq_callback.
-     * Also signal CTC channel 3 (VSync source). */
-    if (m->cpu.iff1) {
+    /* VSync: generate interrupt at end of frame ONLY if CPU is ready.
+     * Don't stack IRQs — only fire if previous one was serviced. */
+    if (m->cpu.iff1 && !m->cpu.irq_pending) {
         z80_irq(&m->cpu, 0xFF);
     }
 

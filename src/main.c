@@ -109,7 +109,8 @@ int main(int argc, char **argv) {
             machine_run_frame(machine);
 
             /* Boot status at key frames */
-            if (machine->frame_count == 50 || machine->frame_count == 200) {
+            if (machine->frame_count == 50 || machine->frame_count == 200 ||
+                machine->frame_count == 500 || machine->frame_count == 1000) {
                 printf("F%3d: PC=%04X SP=%04X IFF=%d IM=%d Pg=%02X/%02X/%02X/%02X\n",
                        machine->frame_count,
                        machine->cpu.pc.w, machine->cpu.sp.w,
