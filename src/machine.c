@@ -138,24 +138,6 @@ void machine_mem_write(void *ctx, u16 addr, u8 data) {
 }
 
 u8 machine_opcode_fetch(void *ctx, u16 addr) {
-    sp_machine_t *m = (sp_machine_t *)ctx;
-
-    /* Detect config loader completion:
-     * Loader reaches RST 38 handler at 0x0038 which contains JP 0x0000.
-     * When PC=0x0038 and conf_loading, loader is done with one bitstream.
-     * Also detect if we've been running too long (>5M tstates = ~700ms). */
-    if (m->conf_loading) {
-        if ((addr == 0x0038 && m->conf_bytes > 1000) ||
-            m->cpu.total_tstates > 5000000) {
-            m->conf_loading = false;
-            /* Switch to BIOS: ROM page 8 at WIN0 */
-            m->page_reg[0] = 0x88;
-            z80_reset(&m->cpu);
-            printf("Boot: Config loader done (%u FPGA bytes, %llu tstates)\n",
-                   m->conf_bytes, (unsigned long long)m->cpu.total_tstates);
-            printf("Boot: Starting BIOS from ROM page 8\n");
-        }
-    }
 
     return machine_mem_read(ctx, addr);
 }
@@ -196,7 +178,7 @@ u8 machine_port_read(void *ctx, u16 port) {
         switch (cmos_addr) {
         case 0x0E: return 0x00;  /* Full boot with RAM test */
         case 0x0F: return 0x10;  /* Keyboard delay/repeat default */
-        case 0x10: return 0x02;  /* Boot device: IDE1 */
+        case 0x10: return 0x00;  /* Boot device: FDD1 (0=FDD1, 2=IDE1, 4=ROM) */
         case 0x11: return 0x01;  /* FDD/IDE config */
         case 0x1B: return 0x00;  /* Hardware config: normal speed */
         default: return 0x00;
@@ -238,17 +220,16 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
     /* Page registers */
     if (lo == SP_PORT_PAGE0) {
         m->page_reg[0] = data;
-        /* When BIOS switches WIN0 to RAM page (< 0x80), inject resident code.
-         * This simulates what the FPGA config loader would have prepared. */
+        /* When BIOS switches WIN0 to RAM page (< 0x80), copy the ENTIRE
+         * ROM page 8 content into that RAM page. In real Sprinter, the FPGA
+         * config loader prepares RAM with a copy of the BIOS code so that
+         * after OUT(#82,page), execution continues seamlessly in RAM. */
         if (data < 0x80 && m->rom) {
             u32 rom8 = 8 * ROM_PAGE_SIZE;
             u32 ram_base = (u32)data * ROM_PAGE_SIZE;
-            /* Copy RST vectors (0x0000-0x0070) */
-            memcpy(&m->ram[ram_base], &m->rom[rom8], 0x0070);
-            /* Copy dispatch/jump table (0x0400-0x0FFF) */
-            memcpy(&m->ram[ram_base + 0x0400], &m->rom[rom8 + 0x0400], 0x0C00);
-            /* Copy resident code (0x3F00-0x3FFF) */
-            memcpy(&m->ram[ram_base + 0x3F00], &m->rom[rom8 + 0x3F00], 0x0100);
+            if (ram_base + ROM_PAGE_SIZE <= SP_RAM_SIZE) {
+                memcpy(&m->ram[ram_base], &m->rom[rom8], ROM_PAGE_SIZE);
+            }
         }
         return;
     }

@@ -108,40 +108,18 @@ int main(int argc, char **argv) {
         if (!debugger.active || debugger.state == DBG_STATE_RUNNING) {
             machine_run_frame(machine);
 
-            /* Boot trace */
-            if (machine->frame_count <= 3 ||
-                machine->frame_count == 50 ||
-                machine->frame_count == 200 ||
-                machine->frame_count == 1000) {
-                printf("F%3d: PC=%04X SP=%04X IFF=%d Pg=%02X/%02X/%02X/%02X\n",
+            /* Boot status at key frames */
+            if (machine->frame_count == 50 || machine->frame_count == 200) {
+                printf("F%3d: PC=%04X SP=%04X IFF=%d IM=%d Pg=%02X/%02X/%02X/%02X\n",
                        machine->frame_count,
                        machine->cpu.pc.w, machine->cpu.sp.w,
-                       machine->cpu.iff1,
+                       machine->cpu.iff1, machine->cpu.im,
                        machine->page_reg[0], machine->page_reg[1],
                        machine->page_reg[2], machine->page_reg[3]);
-            }
-            if (machine->frame_count == 1000) {
-                int nonzero = 0;
+                int vram_nz = 0;
                 for (int i = 0; i < SP_VRAM_LINES * SP_VRAM_LINE; i++)
-                    if (machine->vram[i]) nonzero++;
-                printf("VRAM: %d non-zero bytes\n", nonzero);
-                /* Check framebuffer for non-black pixels */
-                int fb_nonblack = 0;
-                for (int i = 0; i < machine->fb_width * machine->fb_height; i++)
-                    if (machine->framebuffer[i] != 0) fb_nonblack++;
-                printf("FB: %d non-black pixels\n", fb_nonblack);
-                /* Check RAM page 0 at 0x0800 (BIOS dispatch table) */
-                printf("RAM[0] @0x0800: ");
-                for (int i = 0; i < 16; i++) printf("%02X ", machine->ram[0x0800 + i]);
-                printf("\n");
-                /* Check RAM page 0 at 0x0000 (RST vectors) */
-                printf("RAM[0] @0x0000: ");
-                for (int i = 0; i < 16; i++) printf("%02X ", machine->ram[0x0000 + i]);
-                printf("\n");
-                /* Check RAM page 0 at 0x3FD0 (resident) */
-                printf("RAM[0] @0x3FD0: ");
-                for (int i = 0; i < 16; i++) printf("%02X ", machine->ram[0x3FD0 + i]);
-                printf("\n");
+                    if (machine->vram[i]) vram_nz++;
+                printf("  VRAM: %d non-zero bytes\n", vram_nz);
                 fflush(stdout);
             }
         }
