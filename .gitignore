@@ -28,3 +28,5 @@ Thumbs.db
 # ROM files (user-provided)
 roms/*.rom
 roms/*.bin
+*.log
+diag*.txt

@@ -93,16 +93,16 @@ static void set_win_fastram(sp_machine_t *m, int win, u8 fr_page) {
     m->win_page[win] = 0xF0 + (fr_page & 3); /* pseudo-page for fastram */
 }
 
-/* Calculate WIN3 page from registers (MAME lines 370-389) */
-static u8 calc_win3_page(sp_machine_t *m) {
-    u8 pg3_idx = ((~m->pn >> 7) & 1) << 5
-               | 0x10
-               | ((((m->sc >> 4) & 1) && !((m->cnf >> 7) & 1))
-                 || (((m->cnf >> 7) & 1) && ((m->pn >> 6) & 1))) << 3
-               | (m->pn & 0x07);
-    /* pg3_idx is index into ram_pages, range 0x10-0x3F */
-    pg3_idx &= 0x3F;
-    return m->ram_pages[pg3_idx];
+/* Calculate WIN3 page index and page from registers (MAME lines 373-374) */
+static u8 calc_pg3_idx(sp_machine_t *m) {
+    u8 idx = (u8)(
+        (((~m->pn >> 7) & 1) << 5) |
+        0x10 |
+        ((((m->sc >> 4) & 1) && !((m->cnf >> 7) & 1)) ||
+         (((m->cnf >> 7) & 1) && ((m->pn >> 6) & 1))) << 3 |
+        (m->pn & 0x07)
+    );
+    return idx & 0x3F;
 }
 
 void update_memory(sp_machine_t *m) {
@@ -122,10 +122,25 @@ void update_memory(sp_machine_t *m) {
             /* FastRAM mode */
             set_win_fastram(m, 0, m->rom_rg & 3);
         } else {
-            /* RAM mode (rom_sys=1, cash_on=0, or both) */
-            /* Simplified: use ram_pages[0x28] (port 0xE8 default) */
-            u8 pg0_idx = 0x28; /* This is a simplification; full calc uses PN/SC/DOS */
-            set_win_ram(m, 0, m->ram_pages[pg0_idx]);
+            /* RAM/system mode — MAME update_memory() else branch */
+            bool sc0   = (m->sc >> 0) & 1;
+            bool sc_lc = !(sc0 && m->ram_sys);
+            u8   dos   = m->dos_mode ? 1 : 0;
+            u8   spr_  = ((m->sc >> 1) & 1) ? 0
+                       : (u8)((dos << 1) | (((m->pn >> 4) & 1) || !dos));
+            u8   pg0   = (u8)(0x20
+                | ((sc0 || !m->ram_sys || !m->nmi_ena) << 3)
+                | ((m->arom16 && !(sc0 && m->ram_sys)) << 2)
+                | ((((spr_ >> 1) & 1 && sc_lc) || !m->ram_sys || !m->nmi_ena) << 1)
+                | (((spr_ >> 0) & 1 && sc_lc) || !m->ram_sys || !m->nmi_ena));
+            if (sc0 && m->ram_sys) {
+                m->win_rd[0]  = NULL;
+                m->win_wr[0]  = NULL;
+                m->win_page[0] = 0xFF;
+            } else {
+                set_win_ram(m, 0, m->ram_pages[pg0]);
+                m->win_wr[0] = NULL;  /* read-only */
+            }
         }
     }
 
@@ -140,20 +155,38 @@ void update_memory(sp_machine_t *m) {
     TRACE_PAGE(m->cpu.total_tstates, m->cpu.pc.w, 1, m->win_page[1], "RW");
     TRACE_PAGE(m->cpu.total_tstates, m->cpu.pc.w, 2, m->win_page[2], "RW");
 
-    /* WIN3: page 0x40 during starting, otherwise from ram_pages or PN/SC calc */
+    /* WIN3: page 0x40 during starting, otherwise from ram_pages indexed by pg3_idx */
+    m->pg3_idx = calc_pg3_idx(m);
     if (m->starting) {
         set_win_ram(m, 3, 0x40);
     } else {
-        /* Use ram_pages[0x2B] if directly set, otherwise calc from registers */
-        u8 page3 = m->ram_pages[0x2B];
-        if (page3 == 0xFF || page3 == 0x41) {
-            /* Default/unset: calculate from PN/SC/CNF */
-            page3 = calc_win3_page(m);
-        }
-        set_win_ram(m, 3, page3);
+        set_win_ram(m, 3, m->ram_pages[m->pg3_idx]);
     }
     TRACE_PAGE(m->cpu.total_tstates, m->cpu.pc.w, 3, m->win_page[3],
                m->starting ? "START" : "RW");
+}
+
+/* ================================================================
+ * Soft reset: resets CPU and control registers only.
+ * Preserves RAM pages and DCP table (page 0x40) for warm restart.
+ * ================================================================ */
+static void machine_soft_reset(sp_machine_t *m) {
+    z80_reset(&m->cpu);
+    m->starting = true;
+    m->rom_rg  = 0x00;
+    m->rom_sys = false;
+    m->cash_on = false;
+    m->dos_mode = true;
+    m->ram_sys = false;
+    m->sys_pg  = 0;
+    m->arom16  = false;
+    m->nmi_ena = true;
+    m->pn = 0x00;
+    m->sc = 0x00;
+    m->cnf = 0x00;
+    m->isa_addr_ext = 0;
+    update_memory(m);
+    TRACE_BOOT(m->cpu.total_tstates, 0, "soft reset (RAM/DCP preserved)");
 }
 
 /* ================================================================
@@ -231,6 +264,15 @@ void machine_mem_write(void *ctx, u16 addr, u8 data) {
         return;
     }
 
+    /* Warm restart trigger: sc=0x10, WIN3=page 0xA0, write to WIN3.
+     * MAME: if (Bank==3 && sc==0x10 && pages[3]==(BANK_RAM_MASK|0xa0)) soft_reset */
+    if (win == 3 && m->sc == 0x10 && m->win_page[3] == 0xA0) {
+        TRACE_BOOT(m->cpu.total_tstates, m->cpu.pc.w,
+                   "warm restart trigger (WIN3 write sc=0x10 page=0xA0)");
+        machine_soft_reset(m);
+        return;
+    }
+
     /* Normal RAM write */
     if (m->win_wr[win]) {
         m->win_wr[win][offset] = data;
@@ -258,94 +300,110 @@ u8 machine_port_read(void *ctx, u16 port) {
     sp_machine_t *m = (sp_machine_t *)ctx;
     u8 lo = port & 0xFF;
 
-    /* First port read clears starting flag (MAME: dcp_r line 579) */
+    /* First port read clears starting flag */
     if (m->starting) {
         TRACE_BOOT(m->cpu.total_tstates, m->cpu.pc.w,
                    "starting cleared by port READ %04X", (unsigned)port);
         m->starting = false;
         update_memory(m);
+        /* Dump DCPP for key ports after DCP_INIT */
+        static const struct { u16 port; int rw; const char *name; } key_ports[] = {
+            {0x0082, 0, "PAGE0 wr"}, {0x00A2, 0, "PAGE1 wr"},
+            {0x00C2, 0, "PAGE2 wr"}, {0x00E2, 0, "PAGE3 wr"},
+            {0x00E2, 1, "PAGE3 rd"},
+            {0x1FFD, 0, "SC wr"},    {0x7FFD, 0, "PN wr"},
+            {0xFFBD, 1, "CMOS rd"},  {0xDFBD, 0, "CMOS adr"}, {0xBFBD, 0, "CMOS dat"},
+        };
+        for (int i = 0; i < (int)(sizeof(key_ports)/sizeof(key_ports[0])); i++) {
+            u16 off = dcp_compute_offset(m, key_ports[i].port, key_ports[i].rw);
+            u8 dcpp = m->ram[0x100000 + off];
+            printf("  DCPP[%s port=%04X off=%04X] = %02X\n",
+                   key_ports[i].rw?"R":"W", key_ports[i].port, off, dcpp);
+        }
     }
 
-    /* === Direct-decoded ports (not through DCP) === */
-
-    /* CTC (Z84C15 internal: 0x10-0x13) */
+    /* Z84C15 internal: CTC and SIO are decoded before DCP */
     if (lo >= 0x10 && lo <= 0x13) return ctc_read(&m->ctc, lo - 0x10);
-
-    /* SIO (Z84C15 internal: 0x18-0x1B) */
     if (lo == 0x18) return sio_read_data(&m->sio, 0);
     if (lo == 0x19) return sio_read_ctrl(&m->sio, 0);
     if (lo == 0x1A) return sio_read_data(&m->sio, 1);
     if (lo == 0x1B) return sio_read_ctrl(&m->sio, 1);
 
-    /* CMOS/RTC: port 0x1C = data read (DCP: CMOS_DAT_RD)
-     * Only treat as CMOS when high byte suggests actual CMOS access.
-     * For IN A,(#1C) the port is (A<<8)|0x1C — high byte varies.
-     * For IN A,(C) with BC set to specific CMOS port — also handled. */
-    if (lo == 0x1C) {
-        u8 val = rtc_read(&m->rtc);
-        TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
-                   "RD addr=%02X val=%02X", m->rtc.addr_reg, val);
-        return val;
-    }
-
-    /* ISA CMOS ports: IN A,(C) with BC=0xFFBD → CMOS data read */
-    if (lo == 0xBD && (port & 0xFF00) == 0xFF00) {
-        u8 val = rtc_read(&m->rtc);
-        TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
-                   "ISA RD addr=%02X val=%02X", m->rtc.addr_reg, val);
-        return val;
-    }
-
-    /* Port #FE: keyboard matrix */
-    if (lo == 0xFE) {
-        u8 result = 0xFF;
-        u8 rows = ~(port >> 8);
-        for (int i = 0; i < 8; i++)
-            if (rows & (1 << i))
-                result &= m->key_matrix[i];
-        return result;
-    }
-
-    /* === DCP-decoded ports (simplified matching MAME dcp_r switch) === */
-
-    /* System port reads: ram_pages values */
-    if (lo >= 0xC0) {
-        u8 idx = lo - 0xC0;
-        /* Some system ports return register values */
-        switch (lo) {
-        case 0xC0: return m->sc;        /* 1FFD */
-        case 0xC1: return m->pn;        /* 7FFD */
-        case 0xC3: return m->all_mode;  /* ALL_MODE */
-        case 0xC4: case 0xCC: return m->port_y;
-        case 0xC5: case 0xCD: return m->rgmod;
-        default:
-            if (idx < 64) return m->ram_pages[idx];
-            return 0xFF;
-        }
-    }
-
-    /* IDE: no device present */
-    if (lo >= 0x50 && lo <= 0x57) return 0x00;
-
-    /* FDD (WD1793): not ready */
-    if (lo == 0x1F) return 0x80;
-    if (lo == 0x3F || lo == 0x5F || lo == 0x7F) return 0x00;
-
-    /* AY read */
-    if (lo == 0x8D || lo == 0x8E) return 0xFF;
-
-    /* cash_on control via port read (MAME: dcp_r line 585) */
+    /* cash_on: special-cased before DCP */
     if ((lo & 0x7F) == 0x7B) {
         m->cash_on = (port >> 7) & 1;
         update_memory(m);
-        return 0xFF;
     }
 
-    {
-        u8 val = bus_port_read(&m->bus, port);
-        TRACE_PORT_R(m->cpu.total_tstates, m->cpu.pc.w, port, val);
-        return val;
+    /* DCP lookup */
+    u8 dcpp = dcp_lookup_port(&m->dcp, m, port, 1);
+    u8 data = 0xFF;
+
+    switch (dcpp) {
+    case 0x00:  /* no port */
+        break;
+
+    /* FDD (WD1793) */
+    case 0x10: data = 0x80; break;  /* status: not ready */
+    case 0x11: case 0x12: case 0x13: case 0x15:
+        data = 0x00; break;
+
+    /* CMOS/RTC */
+    case 0x1C:
+        data = rtc_read(&m->rtc);
+        TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
+                   "RD addr=%02X val=%02X", m->rtc.addr_reg, data);
+        break;
+
+    /* IDE: no device */
+    case 0x20: case 0x21: case 0x22: case 0x23:
+    case 0x24: case 0x25: case 0x26: case 0x27:
+    case 0x28: case 0x29:
+        data = 0x00;
+        break;
+
+    /* Keyboard */
+    case 0x40: {
+        u8 result = 0xFF;
+        u8 rows = (u8)(~(port >> 8));
+        for (int i = 0; i < 8; i++)
+            if (rows & (1 << i))
+                result &= m->key_matrix[i];
+        data = result;
+        break;
     }
+
+    /* AY read */
+    case 0x52:
+        data = 0xFF;
+        break;
+
+    /* System ports: specific registers */
+    case 0xC0: case 0xC8:
+        data = m->sc; break;
+    case 0xC1: case 0xC9:
+        data = m->pn; break;
+    case 0xC3:
+        data = m->all_mode; break;
+    case 0xC4: case 0xCC:
+        data = m->port_y; break;
+    case 0xC5: case 0xCD:
+        data = m->rgmod; break;
+
+    default:
+        if (dcpp >= 0xC0 && dcpp <= 0xEF) {
+            data = m->ram_pages[dcpp - 0xC0];
+        } else if (dcpp >= 0xF0) {
+            /* WIN3 page read */
+            data = m->ram_pages[m->pg3_idx];
+        } else {
+            data = bus_port_read(&m->bus, port);
+        }
+        break;
+    }
+
+    TRACE_PORT_R(m->cpu.total_tstates, m->cpu.pc.w, port, data);
+    return data;
 }
 
 void machine_port_write(void *ctx, u16 port, u8 data) {
@@ -353,9 +411,7 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
     u8 lo = port & 0xFF;
     TRACE_PORT_W(m->cpu.total_tstates, m->cpu.pc.w, port, data);
 
-    /* During starting, ALL I/O writes are ignored (MAME: dcp_w returns immediately).
-     * The starting flag is only cleared by port READS, not writes.
-     * This matches the real DCP hardware behavior. */
+    /* During starting, ALL I/O writes are ignored */
     if (m->starting) {
         TRACE_BOOT(m->cpu.total_tstates, m->cpu.pc.w,
                    "WRITE %04X=%02X IGNORED (starting)",
@@ -363,18 +419,14 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
         return;
     }
 
-    /* === Special-cased ports (before DCP): 0x3C/0x7C === */
+    /* Special-cased before DCP: ROM control ports 0x3C/0x7C */
     if ((lo & 0xBF) == 0x3C) {
-        /* Port 0x3C: rom_sys=1 (RAM/FastRAM at WIN0)
-         * Port 0x7C: rom_sys=0 (ROM at WIN0) */
-        m->rom_sys = !((lo >> 6) & 1);  /* bit6: 0→rom_sys=1, 1→rom_sys=0 */
+        m->rom_sys = !((lo >> 6) & 1);
         if (!(data & 0x02))
             m->sys_pg = ((m->rom_rg >> 4) & 1) || (data & 1);
         update_memory(m);
         return;
     }
-
-    /* Port 0x5C: ROM register (only when rom_sys=0) */
     if (lo == 0x5C && !m->rom_sys) {
         m->rom_rg = data;
         m->sys_pg |= (m->rom_rg >> 4) & 1;
@@ -382,142 +434,138 @@ void machine_port_write(void *ctx, u16 port, u8 data) {
         return;
     }
 
-    /* === Direct-decoded ports === */
-
-    /* CTC */
+    /* Z84C15 internal: CTC and SIO before DCP */
     if (lo >= 0x10 && lo <= 0x13) { ctc_write(&m->ctc, lo - 0x10, data); return; }
-    /* SIO */
     if (lo == 0x18) { sio_write_data(&m->sio, 0, data); return; }
     if (lo == 0x19) { sio_write_ctrl(&m->sio, 0, data); return; }
     if (lo == 0x1A) { sio_write_data(&m->sio, 1, data); return; }
     if (lo == 0x1B) { sio_write_ctrl(&m->sio, 1, data); return; }
-    /* CMOS ports (DCP: 0x1C=DAT_RD, 0x1D=ADR_WR, 0x1E=DAT_WR)
-     * Port 0x1C is CMOS_DAT_RD — writes to it are NOT CMOS operations.
-     * The BIOS uses OUT(#1C),A with various A values for DCP page config,
-     * not for CMOS access. CMOS address is set via port 0x1D only.
-     * CMOS data writes go through port 0x1E. */
-    if (lo == 0x1C) {
-        /* NOT a CMOS operation — DCP page configuration or no-op.
-         * On real hardware, OUT(#1C),A goes through DCP which may
-         * reconfigure memory pages based on the full 16-bit port address.
-         * TODO: implement DCP page switching for different A values. */
-        TRACE(TR_PORT_W, m->cpu.total_tstates, m->cpu.pc.w,
-              "PW %04X=%02X (port 1C write, not CMOS)", (unsigned)port, (unsigned)data);
-        return;
-    }
-    if (lo == 0x1D) {
-        TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
-                   "ADR=%02X", data);
+
+    /* DCP lookup */
+    u8 dcpp = dcp_lookup_port(&m->dcp, m, port, 0);
+
+    /* System ports 0xC0-0xEF: always write to ram_pages */
+    if (dcpp >= 0xC0 && dcpp <= 0xEF)
+        m->ram_pages[dcpp - 0xC0] = data;
+
+    switch (dcpp) {
+    case 0x00:  /* no port */
+        break;
+
+    /* FDD */
+    case 0x10: case 0x11: case 0x12: case 0x13: case 0x14:
+    case 0x16: case 0x17:
+        break;  /* TODO: FDD */
+
+    /* ISA control */
+    case 0x1B:
+        m->isa_addr_ext = data & 0x3F;
+        break;
+
+    /* CMOS/RTC */
+    case 0x1D:
+        TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w, "ADR=%02X", data);
         rtc_write_addr(&m->rtc, data);
-        return;
-    }
-    if (lo == 0x1E) {
+        break;
+    case 0x1E:
         TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
                    "WR addr=%02X val=%02X", m->rtc.addr_reg, data);
         rtc_write_data(&m->rtc, data);
-        return;
-    }
+        break;
 
-    /* ISA CMOS ports: OUT(C),A with BC=0xDFBD → address, 0xBFBD → data write */
-    if (lo == 0xBD) {
-        u8 hi = (port >> 8) & 0xFF;
-        if (hi == 0xDF || (hi & 0xE0) == 0xC0) {
-            /* CMOS_AWR: address write */
-            TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
-                       "ISA ADR=%02X", data);
-            rtc_write_addr(&m->rtc, data);
-            return;
-        }
-        if (hi == 0xBF || (hi & 0xE0) == 0xA0) {
-            /* CMOS_DWR: data write */
-            TRACE_CMOS(m->cpu.total_tstates, m->cpu.pc.w,
-                       "ISA WR addr=%02X val=%02X", m->rtc.addr_reg, data);
-            rtc_write_data(&m->rtc, data);
-            return;
-        }
-    }
-    /* Port #FE */
-    if (lo == 0xFE) { m->port_fe = data; return; }
+    /* IDE: no device */
+    case 0x20: case 0x21: case 0x22: case 0x23:
+    case 0x24: case 0x25: case 0x26: case 0x27:
+    case 0x28: case 0x29:
+        break;
 
-    /* === Sprinter page register ports (DCP-decoded in real HW) ===
-     * Ports 0x82/0xA2 are below 0xC0, need explicit handlers.
-     * For OUT(n),A: port = (A<<8)|n. When A is the page number,
-     * high byte is small (0x00-0x3F typically). When high byte is
-     * 0xFF or other large values, the DCP routes to a different
-     * handler — NOT a page register write. */
-    if (lo == 0x82 && (port >> 8) < 0x80) {
-        m->ram_pages[0x28] = data; update_memory(m); return;
-    }
-    if (lo == 0xA2 && (port >> 8) < 0x80) {
-        m->ram_pages[0x29] = data; update_memory(m); return;
-    }
+    /* Soft reset (BIOS reload) */
+    case 0x2E:
+        m->conf_loading = true;
+        machine_soft_reset(m);
+        break;
 
-    /* === DCP-decoded system ports 0xC0-0xFF → ram_pages writes === */
-    if (lo >= 0xC0) {
-        u8 idx = lo - 0xC0;
-        switch (lo) {
-        case 0xC0: /* 1FFD (SC register) */
-            m->sc = data;
-            update_memory(m);
-            return;
-        case 0xC1: /* 7FFD (PN register) */
-            m->pn = data;
-            update_memory(m);
-            return;
-        case 0xC2: /* Border / ZX video */
-            m->port_fe = (m->port_fe & 0xF8) | (data & 0x07);
-            return;
-        case 0xC3: /* ALL_MODE */
-            m->all_mode = data;
-            return;
-        case 0xC4: case 0xCC: /* PORT_Y */
-            m->port_y = data;
-            return;
-        case 0xC5: case 0xCD: /* RGMOD */
-            m->rgmod = data;
-            return;
-        case 0xC6: case 0xCE: /* CNF/SYS */
-            m->ram_sys = !((lo >> 6) & 1);
-            if (data & 0x04) m->cnf = data;
-            if (data & 0x02) m->turbo = data & 1;
-            else m->arom16 = data & 1;
-            update_memory(m);
-            return;
-        case 0xCB: /* Scroll */
-            m->scroll_reg = data;
-            m->hold_x = (i16)((7 - (data & 0x0F)) * 2);
-            m->hold_y = (i16)(7 - (data >> 4));
-            return;
-        default:
-            /* All other 0xC0-0xFF: write to ram_pages table */
-            if (idx < 64) {
-                m->ram_pages[idx] = data;
-                update_memory(m);
-            }
-            return;
-        }
-    }
+    /* COVOX / PORT_Y */
+    case 0x88: case 0x89:
+        m->port_y = data;
+        break;
 
-    /* Port 0x8F: ROM/FastRAM page register (alternate) */
-    if (lo == 0x8F) {
+    /* ROM/fastram page */
+    case 0x8F:
         m->rom_rg = data;
+        m->sys_pg = (u8)(((m->rom_rg >> 4) & 1) || (data & 1));
         update_memory(m);
-        return;
+        break;
+
+    /* AY address write */
+    case 0x8D: case 0x90:
+        break;  /* TODO: AY */
+
+    /* AY data write */
+    case 0x8E: case 0x91:
+        break;  /* TODO: AY */
+
+    /* System port handlers */
+    case 0xC0: case 0xC8:   /* SC (1FFD) */
+        m->sc = data;
+        update_memory(m);
+        break;
+    case 0xC1: case 0xC9:   /* PN (7FFD) */
+        m->pn = data;
+        update_memory(m);
+        break;
+    case 0xC2:              /* Border / ZX ULA */
+        m->port_fe = (m->port_fe & 0xF8) | (data & 0x07);
+        break;
+    case 0xC3:              /* ALL_MODE */
+        m->all_mode = data;
+        break;
+    case 0xCB:              /* Scroll */
+        m->scroll_reg = data;
+        m->hold_x = (i16)((7 - (data & 0x0F)) * 2);
+        m->hold_y = (i16)(7 - (data >> 4));
+        break;
+    case 0xC4: case 0xCC:   /* PORT_Y */
+        m->port_y = data;
+        break;
+    case 0xC5: case 0xCD:   /* RGMOD */
+        m->rgmod = data;
+        break;
+    case 0xC6: case 0xCE:   /* CNF/SYS */
+        m->ram_sys = !((lo >> 6) & 1);
+        if (data & 0x02) m->turbo = data & 1;
+        else m->arom16 = data & 1;
+        if (data & 0x04) m->cnf = data;
+        update_memory(m);
+        break;
+    case 0xC7: case 0xCF:   /* alternate accelerator */
+        break;
+
+    /* RAM page registers: ram_pages already written above, just update memory */
+    case 0xD0: case 0xD1: case 0xD2: case 0xD3:
+    case 0xD4: case 0xD5: case 0xD6: case 0xD7:
+    case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+    case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+    case 0xE0: case 0xE1: case 0xE2: case 0xE3:
+    case 0xE4: case 0xE5: case 0xE6: case 0xE7:
+    case 0xE8: case 0xE9: case 0xEA: case 0xEB:
+    case 0xEC: case 0xED: case 0xEE: case 0xEF:
+        update_memory(m);
+        break;
+
+    /* WIN3 page register */
+    case 0xF0: case 0xF1: case 0xF2: case 0xF3:
+    case 0xF4: case 0xF5: case 0xF6: case 0xF7:
+    case 0xF8: case 0xF9: case 0xFA: case 0xFB:
+    case 0xFC: case 0xFD: case 0xFE: case 0xFF:
+        m->ram_pages[m->pg3_idx] = data;
+        update_memory(m);
+        break;
+
+    default:
+        bus_port_write(&m->bus, port, data);
+        break;
     }
-
-    /* Port 0x89: PORT_Y (also used for COVOX mode) */
-    if (lo == 0x89) { m->port_y = data; return; }
-
-    /* FPGA config ports */
-    if (lo == 0xEE || lo == 0xEF) return;
-    /* IDE write ports */
-    if (lo >= 0x50 && lo <= 0x57) return;
-    /* FDD write ports */
-    if (lo == 0x1F || lo == 0x3F || lo == 0x5F || lo == 0x7F || lo == 0xFF) return;
-    /* AY ports */
-    if (lo == 0x8D || lo == 0x8E) return;
-
-    bus_port_write(&m->bus, port, data);
 }
 
 /* ================================================================
@@ -610,7 +658,7 @@ sp_machine_t *machine_create(sp_config_t *config) {
         return NULL;
     }
 
-    /* Initialize DCP port decode table */
+    /* Initialize DCP stub (table in RAM, populated in machine_reset) */
     dcp_init(&m->dcp);
 
     /* Initialize bus, CPU, peripherals */
@@ -683,6 +731,9 @@ void machine_reset(sp_machine_t *m) {
 
     /* Initialize RAM page table */
     memcpy(m->ram_pages, default_ram_pages, sizeof(default_ram_pages));
+
+    /* Initialize DCP table in RAM page 0x40 with default port mappings */
+    dcp_init_default_ram(m->ram);
 
     /* RTC/CMOS reset */
     rtc_reset(&m->rtc);

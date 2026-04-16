@@ -89,6 +89,12 @@ typedef struct sp_machine {
     bool           starting;      /* True until first port read after reset */
     u32            conf_bytes;    /* Bytes written during conf_loading */
 
+    /* Computed WIN3 index into ram_pages (updated by update_memory) */
+    u8             pg3_idx;
+
+    /* ISA extension register (dcpp 0x1B) */
+    u8             isa_addr_ext;
+
     /* === Video === */
     u8             port_y;     /* PORT_Y: VRAM Y-address (row for access) */
     u8             rgmod;      /* RGMOD register */

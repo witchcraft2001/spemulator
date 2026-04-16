@@ -146,12 +146,14 @@ The Sprinter SP2000 is a Z84C15-based computer running at 7/21 MHz with:
 ## Status
 
 - Z80 CPU: complete (all prefixes, undocumented instructions, cycle timing)
-- Boot: Phase 1 and Phase 2 working, BIOS reaches main initialization
+- Boot: Phase 1 (config loader) and Phase 2 (BIOS) working; DCP table initialized by BIOS; BIOS reaches main initialization and ram_pages setup
 - CMOS/RTC: working (both DCP ports and ISA ports)
+- Memory management: WIN0 pg0 formula (MAME-accurate), warm restart trigger, soft reset preserving DCP table
 - Memory tests: passing
 - Port register tests: passing
+- DCP port routing: full 14-bit table initialized, default DCPP values populated, BIOS overwrites via WIN3 during starting phase
 - Video output: framework implemented, needs BIOS to complete init
-- DCP port routing: simplified (full DCP table not yet implemented)
+- NMI: not yet implemented (needed for PROG_NO_ROM HALT exit)
 - Disk: IDE/FDD stubs, no bootable media support yet
 
 ## References
